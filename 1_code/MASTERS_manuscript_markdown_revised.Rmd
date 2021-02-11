@@ -1,0 +1,2288 @@
+---
+title: "Muscle Transcriptional Networks Underlying Hypertrophic Response Heterogeneity"
+author: "Kaleen Lavin"
+date: "10/28/2020"
+output:
+  html_document:
+    df_print: paged
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+---
+
+```{r Load Tools, include=FALSE}
+library(knitr)
+library(sva)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(Biobase)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(WGCNA)
+library(tidyverse)
+library(lme4)
+library(Rsubread)
+library(biomaRt)
+library(R.utils)
+library(RCy3)
+library(PLIER)
+library(dplyr)
+library(edgeR)
+library(ggplot2)
+library(matrixStats)
+library(tidyverse)
+library(scales)
+library(dendextend)
+source('../4_functions/MASTERS_functions.R')
+```
+
+#Introduction
+This markdown describes the analysis of RNA-seq data to accompany the manuscript entitled "Muscle Transcriptional Networks Underlying Hypertrophic Response Heterogeneity". 
+
+The general workflow is as follows (Figure 1).
+```{r figure 1, fig.height = 10, fig.width = 7.5, fig.align = "center"}
+include_graphics("../2_pipeline/Figure_1.pdf")
+```
+## R version and libraries
+For replication purposes:
+```{r version used}
+r <- R.Version()
+r$version.string
+```
+
+# Preparation of Data 
+## Gene Expression Data
+All samples were aligned to genome in STAR and converted to featureCounts in R. 
+```{r load gene data}
+load("../../0_data/1_featureCounts/updated_MASTERS_cts.Rdata")
+load("../../0_data/3_gene_data/gene_data.Rdata")
+```
+
+## Subject Data
+Subjects are retained if they have both CT (primary outcome) and DXA data. These data sets were stored and organized independently, so we need to do some work to bring them together and fit them the the 31 participants for whom we have baseline RNA-seq.
+```{r phenotype file}
+MASTERSpheno <- read.csv("../../0_data/2_phenotype/MASTERSphenofile.csv")
+
+MASTERSpheno <- MASTERSpheno %>% 
+  mutate(PID = str_extract(SubjectID, pattern = "(?<=MAS)[:digit:]{3}|(?<=MET)[:digit:]{2}")) %>% 
+  mutate(SeqID_w0 = str_c("P",PID,"1",sep="_"),
+         SeqID_w16 = str_c("P",PID,"3",sep="_"),
+         SeqID_w0 = ifelse(nchar(SeqID_w0)==6,gsub(pattern = "P_0", replacement = "P_", SeqID_w0),SeqID_w0),
+         SeqID_w16 = ifelse(nchar(SeqID_w16)==6,gsub(pattern = "P_0", replacement = "P_", SeqID_w16),SeqID_w16),
+         SeqID = ifelse(SubjectID=="UKMET05","05_1",SeqID),
+         SeqID = ifelse(SubjectID=="UKMET08","08_1",SeqID)) %>% 
+  filter((SeqID_w0 %in% names(cts.updated) & SeqID_w16 %in% names(cts.updated))|(SeqID_w0 %in% names(cts.updated)))
+MASTERSpheno
+```
+
+```{r bring in DEXA}
+working.pheno.long <- MASTERSpheno %>% 
+  dplyr::select(-SeqID) %>% 
+  pivot_longer(cols = contains("SeqID"), names_to = NULL, values_to = "SeqID") %>% 
+  filter(SeqID %in% names(cts.updated))
+
+load(file = "../../0_data/2_phenotype/final_rnaseq_phenotype.RData")
+anti_join(MASTERSpheno,final_rnaseq_phenotype, by="SubjectID") #check that all are there
+
+DEXA <- left_join(MASTERSpheno,final_rnaseq_phenotype, by="SubjectID") %>% 
+  mutate(delta_bilateral_thigh_normalized = bilateral_thigh_mass_normalized_w16 - bilateral_thigh_mass_normalized_w0,
+         delta_bilateral_thigh = bilateral_thigh_mass_w16 - bilateral_thigh_mass_w0,
+         percent_delta_bilateral_thigh = 
+           (bilateral_thigh_mass_w16 - bilateral_thigh_mass_w0)/bilateral_thigh_mass_w0 * 100)
+DEXA
+```
+
+```{r bring in CT}
+#bring in CT and drop MET group
+MASTERS_CT <- read.csv(file="../../0_data/2_phenotype/CT_data_for_UAB_09_18_2019.csv", 
+                       header=TRUE, stringsAsFactors = FALSE)
+MASTERS_CT <- MASTERS_CT %>%
+  #filter(group_placement==" PLA") %>% #40
+  rename("SubjectID" = "study_id")
+
+#create naming convention
+df_id <- as.data.frame(names(MASTERS_CT)) %>% 
+  rename("old"= "names(MASTERS_CT)") %>% 
+  mutate("new" = ifelse(str_detect(old, "^wk16_"),str_c(old, "_w16",sep=""),str_c(old,"_w0",sep="")),
+         new = str_to_lower(gsub(pattern = "^wk16_", replacement = "", new)),
+         new = gsub("^\\.","", new)) 
+
+CT.clean <- MASTERS_CT %>% 
+  rename_with(~str_replace_all(., df_id$old, df_id$new)) %>% 
+  rename("SubjectID"= "subjectid_w0") %>% 
+  dplyr::select(-group_placement_w0)
+CT.clean
+```
+
+```{r merge to have dexa and ct together}
+MASTERSpheno <- full_join(DEXA, CT.clean, by="SubjectID") %>% 
+  filter(!is.na(d_area_w0)) %>%  #filter out those who have no CT data
+  filter((SeqID_w0 %in% names(cts.updated) & SeqID_w16 %in% names(cts.updated))|
+           (SeqID_w0 %in% names(cts.updated))) #drop subj with no seq data
+```
+
+```{r bring in histology}
+IHCtemp <- read.csv(file="../../0_data/2_phenotype/IHC_cleaned.csv")
+ihc.seq <- IHCtemp %>% 
+  mutate(SubjectID = gsub("UABMAS","P_",SubjectID),
+         SubjectID = gsub("UKMET0","P_",SubjectID), #get low numbers too
+         SubjectID = gsub("UKMET","P_",SubjectID)) %>% 
+  unite(SeqID, c(SubjectID, Biopsy), sep="_", remove = FALSE, na.rm = TRUE) %>% 
+  filter(SeqID %in% names(cts.updated)) 
+ihc.summary <- ihc.seq %>% 
+  dplyr::select(SeqID, Biopsy, contains("Percent"))
+ihc.summary <- ihc.seq %>% 
+  mutate(TypeI_percent = round(X_Cy5_Percent*100,0),
+         TypeIIa_percent = round(X_EGFP_Percent*100,0),
+         TypeIIx_percent = round(X_Texas.Red_Percent*100,0),
+         Hybrid_percent = round(Hybrids_Percent*100,0),
+         TypeIItot_percent = TypeIIa_percent + TypeIIx_percent + Hybrid_percent) %>% 
+  dplyr::select(SeqID, contains("Type"), Hybrid_percent,contains("csa"),-contains("%")) %>% 
+  rename("TypeI_CSA" = "X_Cy5_csa",
+         "TypeIIa_CSA" = "X_EGFP_csa",
+         "TypeIIx_CSA" = "X_Texas.Red_csa",
+         "Negatives_CSA" = "Negatives_csa",
+         "Hybrids_CSA" = "Hybrids_csa")
+
+mean(ihc.seq$Fiber_Count) #890.4151
+sd(ihc.seq$Fiber_Count) #496.6494
+```
+
+We need to convert the phenotype file to long format in order to create the design matrix that will be used to do the batch adjustment. 
+```{r prepare pheno file in long format}
+pheno1 <- MASTERSpheno %>% 
+  filter(SeqID_w0 %in% names(cts.updated)) %>%  #31 basal
+  dplyr::select(SubjectID, Site, Age, Sex, Treatment, contains("w0")) %>% 
+  rename("avg_hu_w0"="avg_hu_baseline_w0")
+
+names(pheno1)[str_detect(names(pheno1),"_w0")] <- gsub("_w0","",names(pheno1[str_detect(names(pheno1),"w0")]))
+
+pheno3 <- MASTERSpheno %>% 
+  filter(SeqID_w16 %in% names(cts.updated)) %>% #22 both
+  dplyr::select(SubjectID, Site, Age, Sex, Treatment, contains("w16")) %>% 
+  rename("skm_area_r_w16" ="avg_area_r_w16")
+
+names(pheno3)[str_detect(names(pheno3),"_w16")] <- gsub("_w16","",names(pheno3[str_detect(names(pheno3),"w16")]))
+
+pheno3 <- pheno3 %>% 
+  dplyr::select(any_of(names(pheno1))) #no deltas that's okay
+
+pheno.long <- bind_rows(pheno1, pheno3) %>% 
+  rename("Batch" = "Site") %>% 
+  mutate(Batch = ifelse(SubjectID ==("UKMET05"),3,Batch), #mark that new ones are in different batch
+         Batch = ifelse(SubjectID ==("UKMET08"),3,Batch)) %>% 
+  mutate("Timepoint" = str_sub(SeqID, -1)) %>% 
+  relocate(c(SeqID, Timepoint), .after = SubjectID)
+
+rownames(pheno.long) <- pheno.long$SeqID
+
+dim(ihc.summary)
+dim(pheno.long)
+
+pheno.long <- full_join(pheno.long, ihc.summary, by="SeqID")
+pheno.long
+```
+
+Participant Characteristics appear in Table 1.
+```{r participant table 1}
+x <- pheno.long %>% 
+  dplyr::select(Timepoint,Sex,Batch,body_fat_percent,bilateral_thigh_mass_normalized,
+                avg_area,Avg_CSA,TypeIIa_CSA,avg_norm,avg_low,avg_hu) %>% 
+  mutate(Sex = as.factor(Sex), Timepoint = as.factor(Timepoint)) %>% 
+  #we don't have BMI or height and weight in here, so that is not shown
+  mutate(Batch = as.factor(ifelse(Batch==3,2,Batch))) 
+
+numeric_cols <- map_chr(x, is.numeric)
+to_mutate <- names(numeric_cols[numeric_cols ==TRUE])
+all(to_mutate %in% names(x))
+
+a <- x %>% 
+  group_by(Timepoint) %>% 
+  summarise(n_female = length(Sex[Sex =="1"]),
+            n_male = length(Sex[Sex =="2"])) 
+b <- x %>% #apparently this has to be done separately because Batch gets lost when it groups by time
+  group_by(Timepoint) %>% 
+  summarise(n_UAB = length(Batch[Batch =="1"]),
+            n_UK = length(Batch[Batch =="2"])) 
+c <- x %>% 
+  group_by(Timepoint) %>% 
+  summarise(across(.cols = to_mutate, 
+                   .fns = c(mean, sd)))
+
+df_id <- as.data.frame(names(c)) %>% 
+  rename(old = "names(c)") %>% 
+  mutate(new = gsub(pattern = "_1","_mean",old)) %>% 
+  mutate(new = gsub(pattern = "_2","_sd",new))
+           
+c <- c %>% 
+  rename_with(~str_replace_all(., df_id$old, df_id$new)) 
+
+table_1 <- cbind(a,b,c) %>% 
+  dplyr::select(unique(c(names(a),names(b),names(c))))
+table_1
+```
+
+We also report RIN scores, which were collected and stored in a separate data file. 
+```{r sample RIN summary}
+RINscores <- readxl::read_xlsx("../../0_data/2_phenotype/RIN summary.xlsx")
+RINscores <- RINscores %>% 
+  filter(str_detect(ID, "^U"))
+all(RINscores$ID %in% pheno.long$SubjectID) #these are the same as the samples we have
+RINscores %>% 
+  filter(str_detect(ID, "^U")) %>% 
+  summarise(RIN_mean = round(mean(as.numeric(RIN), na.rm = TRUE),1),
+            RIN_sd = round(sd(as.numeric(RIN), na.rm = TRUE),1))
+```
+
+
+```{r prepare pheno file in wide format for heatmap purposes}
+#pheno.wide1 <- adj.pheno.long %>% filter(str_detect(SeqID,"_1$"))
+#names(pheno.wide1)[2:40] <- str_c(names(pheno.wide1[2:40]),"_w0")
+#pheno.wide3 <- adj.pheno.long %>% filter(str_detect(SeqID,"_3$"))
+#names(pheno.wide3)[2:40] <- str_c(names(pheno.wide3[2:40]),"_w16")
+
+pheno.wide <- MASTERSpheno
+rownames(pheno.wide) <- pheno.wide$SeqID_w0
+```
+
+```{r adjust wide data frame for sex to be used in prediction analysis}
+ihc <- pheno.long %>% 
+  dplyr::select("SubjectID","SeqID", contains("TypeI"), "Hybrid_percent", contains("CSA")) %>% 
+  mutate(TimePoint = gsub(".*_","",SeqID),
+         TimePoint = ifelse(TimePoint=="1","w0","w16")) %>% 
+  pivot_wider(id_cols = SubjectID, names_from = TimePoint, 
+              values_from = c(contains("TypeI"), "Hybrid_percent", contains("CSA")))
+
+x <- full_join(MASTERSpheno, ihc, by = "SubjectID") %>% 
+  rename("Batch"="Site")
+
+#filter pheno for pre only
+pheno.wide <- x %>%  
+  mutate(Sex = as.numeric(as.character(Sex)),
+         Batch = as.numeric(as.character(Batch)),
+         d_CT_area = avg_area_w16 - avg_area_w0,
+         d_myofiber_CSA = Avg_CSA_w16 - Avg_CSA_w0)
+
+pheno.wide.fiber <- pheno.wide %>% 
+  mutate(d_typeI_CSA = TypeI_CSA_w16-TypeI_CSA_w0,
+         d_typeIIa_CSA = TypeIIa_CSA_w16-TypeIIa_CSA_w0,
+         d_typeIIx_CSA = TypeIIx_CSA_w16-TypeIIx_CSA_w0,
+         d_hybrid_CSA = Hybrids_CSA_w16-Hybrids_CSA_w0,
+         d_negative_CSA = Negatives_CSA_w16-Negatives_CSA_w0)
+```
+
+####Figure 3
+As a general rule of thumb, figures and tables are numbered based on the order of their presentation in the manuscript, despite where in the workflow they are generated. We have numbered things clearly in order to make it easier to trace where they came from in the code.
+
+We are interested in showing the range of heterogeneity as measured by CT. Here we simply show this using waterfall plot by ordering the subjects based on the degree of hypertrophy as measured by CT. 
+```{r Figure 3 waterfall plot}
+pheno.wide.fiber %>% 
+  filter(!is.na(d_area_w0)) %>% 
+  arrange(d_area_w0) %>% 
+  mutate(position_rank = c(1:31)) %>% 
+  ggplot()+geom_col(mapping = aes(x = position_rank, y = d_area_w0)) +
+  theme_linedraw() + 
+  labs(x="Participant Rank", y = "Change in Thigh Muscle Area (CT)")
+```
+
+The same is performed for the other outcomes and presented in Figures S3A and B.
+```{r Figures S3A and B}
+#Figure S3A
+pheno.wide.fiber %>% 
+  filter(!is.na(delta_bilateral_thigh_normalized)) %>% 
+  arrange(delta_bilateral_thigh_normalized) %>% 
+  mutate(position_rank = c(1:31)) %>% 
+  ggplot +
+  geom_col(mapping = aes(x = position_rank, y = delta_bilateral_thigh_normalized)) +
+  theme_linedraw() +
+  labs(x="Participant Rank", y = "Change in Normalized Bilateral Thigh Lean Mass (DXA)")
+
+#Figure S3B
+pheno.wide.fiber %>% 
+  filter(!is.na(d_myofiber_CSA)) %>% 
+  arrange(d_myofiber_CSA) %>% 
+  mutate(position_rank = c(1:22)) %>% 
+  ggplot + geom_col(mapping = aes(x = position_rank, y = d_myofiber_CSA)) +
+  theme_linedraw() + 
+  labs(x="Participant Rank", y = "Change in Myofiber Cross-Sectional Area (µm2))")
+```
+
+### Phenotype Adjustment for Sex
+The adjustment using residuals varies based on what else is in the data set. In order not to have irrelevant samples influence the residuals for a given subset of samples, we perform the adjustment with all three sets of data: all, basal only, and paired only. 
+```{r adjust pheno long for sex}
+#calculate the residuals with all 53 samples
+adj.pheno.long <- pheno.long %>% 
+  dplyr::select(SubjectID, SeqID, Batch, Age, Sex, everything(), -Treatment)
+
+columns <- c(7:ncol(adj.pheno.long)) ##MANUAL CHANGE
+
+for (i in (1:length(columns))){
+  j <- columns[i]
+  variable <- names(adj.pheno.long[j])
+  
+  pDat.clean_noNA = adj.pheno.long[which(!is.na(adj.pheno.long[,variable])),]
+  adjvar = glm((pDat.clean_noNA[,variable]) ~ pDat.clean_noNA$Sex, family = "gaussian")
+  summary(adjvar)
+  
+  pDat.clean_noNA[,variable] = adjvar$residuals
+  x <- paste("adj",variable, sep = "_")
+  names(pDat.clean_noNA)[names(pDat.clean_noNA)==variable] <- x
+  adj.pheno.long <- left_join(adj.pheno.long, pDat.clean_noNA[,c("SeqID",x)], by = "SeqID")
+}
+
+adj.pheno.long <- adj.pheno.long %>% 
+  dplyr::select(SubjectID, SeqID, Batch, Age, contains("adj_"))
+rownames(adj.pheno.long) <- adj.pheno.long$SeqID
+adj.pheno.long <- adj.pheno.long %>%  
+  mutate(Batch = as.factor(Batch))
+```
+
+We can illustrate this graphically. This is presented in Figure S1:
+```{r Figure S1A before adjustment}
+#load colors to make it look similar to the ggplot output
+hex_codes1 <- hue_pal()(2)                             
+hex_codes1 
+
+#subset to numeric
+y <- names(pheno.long)[map_chr(pheno.long, is.numeric)==TRUE]
+
+find.outliers <- pheno.long %>% 
+  column_to_rownames("SeqID") %>% 
+  dplyr::select(y)
+
+transposed <- t(find.outliers)
+exp.outlier <- find.outliers
+
+# sample network based on squared Euclidean distance
+A.ecl <- adjacency(t(exp.outlier),type="distance")
+
+# this calculates the whole network connectivity
+k.ecl <- as.numeric(apply(A.ecl,2,sum))-1 #add columns of A, subtracts relationship to itself
+
+# standardized connectivity
+Z.k.ecl <- scale(k.ecl) #scale values
+
+# designate samples as outlying if their Z.k.ecl value is below the threshold
+thresholdZ.k.ecl <- -1.5
+
+# the color vector indicates outlyingness (red)
+outlierColor.ecl <- ifelse(Z.k.ecl<thresholdZ.k.ecl,"red","black")
+
+# calculate the cluster tree using flahsClust or hclust
+sampleTree.ecl <- hclust(as.dist(1-A.ecl), method = "average")
+hcd_pheno <- as.dendrogram(sampleTree.ecl)
+key <- as.data.frame(get_nodes_attr(hcd_pheno, "label", na.rm=TRUE))
+names(key) = "ID"
+
+key <- key %>% 
+  mutate(sex = pheno.long$Sex[match(ID, pheno.long$SeqID)]) %>% 
+  mutate(colorkey = ifelse(sex == 2, hex_codes1[2],(ifelse(sex==1, hex_codes1[1],NA))))
+labels_colors(hcd_pheno) <- key$colorkey
+x <- labels_colors(hcd_pheno)
+all(names(x)[x==hex_codes1[1]] %in% pheno.long$SeqID[pheno.long$Sex=="1"])
+all(names(x)[x==hex_codes1[2]] %in% pheno.long$SeqID[pheno.long$Sex=="2"])
+plot(hcd_pheno, type = "rectangle", ylab = "Height")
+```
+An obvious split is seen, but after the adjustment:
+```{r Figure S1A after adjustment}
+for_tree <- adj.pheno.long 
+#subset to numeric
+z <- names(adj.pheno.long)[map_chr(for_tree, is.numeric)==TRUE]
+find.outliers <- for_tree %>% 
+  dplyr::select(z)
+
+transposed <- t(find.outliers)
+exp.outlier <- find.outliers
+
+# sample network based on squared Euclidean distance
+A.ecl <- adjacency(t(exp.outlier),type="distance")
+
+# this calculates the whole network connectivity
+k.ecl <- as.numeric(apply(A.ecl,2,sum))-1 #add columns of A, subtracts relationship to itself
+
+# standardized connectivity
+Z.k.ecl <- scale(k.ecl) #scale values
+
+# designate samples as outlying if their Z.k.ecl value is below the threshold
+thresholdZ.k.ecl <- -1.5
+
+# the color vector indicates outlyingness (red)
+outlierColor.ecl <- ifelse(Z.k.ecl<thresholdZ.k.ecl,"red","black")
+
+# calculate the cluster tree using flahsClust or hclust
+adj.sampleTree.ecl <- hclust(as.dist(1-A.ecl), method = "average")
+hcd_pheno_adj <- as.dendrogram(adj.sampleTree.ecl)
+key <- as.data.frame(get_nodes_attr(hcd_pheno_adj, "label", na.rm=TRUE))
+names(key) = "ID"
+
+key <- key %>% 
+  mutate(sex = pheno.long$Sex[match(ID, pheno.long$SeqID)]) %>% 
+  mutate(colorkey = ifelse(sex == 2, hex_codes1[2],(ifelse(sex==1, hex_codes1[1],NA))))
+labels_colors(hcd_pheno_adj) <- key$colorkey
+x <- labels_colors(hcd_pheno_adj)
+all(names(x)[x==hex_codes1[1]] %in% pheno.long$SeqID[pheno.long$Sex=="1"])
+all(names(x)[x==hex_codes1[2]] %in% pheno.long$SeqID[pheno.long$Sex=="2"])
+plot(hcd_pheno_adj, type = "rectangle", ylab = "Height")
+```
+
+```{r Figure S1B}
+pheno.long %>%  
+  ggplot + 
+  geom_histogram(mapping = aes(x=avg_area, fill = factor(Sex)), binwidth = 20) +
+  ggtitle("CT")
+
+adj.pheno.long %>%
+  mutate(Sex = pheno.long$Sex[match(SeqID, pheno.long$SeqID)]) %>% 
+  ggplot + 
+  geom_histogram(mapping = aes(x=adj_avg_area, fill = factor(Sex)), binwidth = 20) +
+  ggtitle("CT")
+```
+
+####Table 1
+```{r subject table 1 revised}
+y <- pheno.wide.fiber %>% 
+  dplyr::select(SeqID, contains("body_fat_percent"), contains("bilateral_thigh_mass_normalized"),
+                contains("avg_area_w"), contains("Avg_CSA"), starts_with("TypeIIa_CSA"),
+                contains("avg_norm"), contains("avg_low"), contains("avg_hu")) %>% 
+  column_to_rownames(var = "SeqID")
+
+subjecttable <- as.data.frame(names(y)) %>% 
+  rename(parameter = "names(y)") %>% 
+  mutate(mean = NA, sd = NA, ttest = NA)
+
+for (i in 1:(ncol(y)-1)){
+  subjecttable$mean[i] = round(mean(y[,i], na.rm=TRUE),1)
+  subjecttable$sd[i] = round(sd(y[,i], na.rm=TRUE),1)
+  res <- t.test( y[,i],y[,i+1],paired = TRUE)
+  subjecttable$ttest[i] =  ifelse(i%%2!=0, res$p.value,
+                                  subjecttable$ttest[i])
+} #fails at end because there is no way to add a column at end but it's okay, we get what we need
+
+subjecttable$mean[16] = round(mean(y[,16], na.rm=TRUE),1)
+  subjecttable$sd[16] = round(sd(y[,16], na.rm=TRUE),1)
+
+subjecttable %>% 
+  mutate(ttest = round(ttest,2))
+
+```
+
+As described above, residuals will also be calculated on the baseline only and paired only samples, due to the undue influence of unrelated numbers in the data set on the outcomes. The same is done for the gene expression data in the ComBat adjustment sections below.
+```{r rerun subject characteristic }
+resid.pheno.wide <- pheno.wide.fiber %>% 
+  dplyr::select(SubjectID, SeqID, Batch, Age, Sex, everything(), -Treatment,-starts_with("X.."))
+columns <- c(9:ncol(resid.pheno.wide)) ##MANUAL CHANGE
+
+#columns <- 82
+for (i in (1:length(columns))){
+  j <- columns[i]
+  variable <- names(resid.pheno.wide[j])
+  
+  pDat.clean_noNA = resid.pheno.wide[which(!is.na(resid.pheno.wide[,variable])),]
+  adjvar = glm((pDat.clean_noNA[,variable]) ~ pDat.clean_noNA$Sex, family = "gaussian")
+  summary(adjvar)
+  
+  pDat.clean_noNA[,variable] = adjvar$residuals
+  x <- paste("adj",variable, sep = "_")
+  names(pDat.clean_noNA)[names(pDat.clean_noNA)==variable] <- x
+  resid.pheno.wide <- merge(resid.pheno.wide, pDat.clean_noNA[,c("SubjectID",x)], by = "SubjectID", all.x = TRUE)
+}
+
+resid.pheno.wide <- resid.pheno.wide %>% 
+  dplyr::select(SubjectID, SeqID_w0, Batch, Age, contains("adj_")) %>% 
+  mutate(Batch = as.numeric(as.character(Batch)))
+```
+
+```{r adjust paired only for sex to be used in other analyses}
+pairedkey <- summary(as.factor(str_sub(pheno.long$SeqID,0,-3)))
+keep <- names(pairedkey)[pairedkey=="2"]
+
+pheno.long.paired <- pheno.long %>% 
+  filter(str_sub(SeqID,0,-3) %in% keep)
+
+resid.pheno.paired <- pheno.long.paired %>% 
+  dplyr::select("SubjectID","SeqID","Timepoint","Batch","Age","Sex", everything())
+columns <- c(8:ncol(pheno.long.paired)) ##MANUAL CHANGE
+
+for (i in (1:length(columns))){
+  j <- columns[i]
+  variable <- names(resid.pheno.paired[j])
+  
+  pDat.clean_noNA = resid.pheno.paired[which(!is.na(resid.pheno.paired[,variable])),]
+  adjvar = glm((pDat.clean_noNA[,variable]) ~ pDat.clean_noNA$Sex, family = "gaussian")
+  summary(adjvar)
+  
+  pDat.clean_noNA[,variable] = adjvar$residuals
+  x <- paste("adj",variable, sep = "_")
+  names(pDat.clean_noNA)[names(pDat.clean_noNA)==variable] <- x
+  resid.pheno.paired <- merge(resid.pheno.paired, pDat.clean_noNA[,c("SeqID",x)], by = "SeqID", all.x = TRUE)
+}
+
+resid.pheno.paired <- resid.pheno.paired %>% 
+  dplyr::select("SubjectID","SeqID","Timepoint","Batch","Age","Sex","Treatment",contains("adj_")) %>% 
+  column_to_rownames(var = "SeqID")
+```
+
+## Batch Adjustment
+```{r put cts in same order}
+cts <- cts.updated %>% 
+  dplyr::select(pheno.long$SeqID) 
+cts.mat <- as.matrix(cts)
+rownames(pheno.long) <- pheno.long$SeqID
+all(names(cts.mat) == rownames(pheno.long))
+dim(cts.mat)
+```
+
+### Adjust full data set
+For PLIER purposes, we will perform the batch adjustment on all samples together. 
+```{r try  at seq}
+batch <- pheno.long$Batch
+covar.mod <- model.matrix(~as.factor(Sex), data = pheno.long) #establishes reference
+
+#combat_adj <- ComBat_seq(cts.mat, batch = batch, group = NULL, covar_mod = covar.mod)
+load(file = "../../2_pipeline/1_MASTERS_WGCNA/out/ComBat_test.Rdata")
+dim(combat_adj)
+```
+
+####Figure S2
+Below we clean and filter gene data in order to plot the sample dendrogram, Figure 2. 
+```{r figure S2}
+cts.adj <- as.data.frame(combat_adj)
+
+#For this function we use rowSums to determine characteristics of the gene (i.e., row)
+genesums <- vector(length=nrow(cts.adj))
+for (i in 1:length(genesums)){
+  genesums[i] <- rowSums(cts.adj[i,])
+  }
+above0 <- genesums > 0
+length(above0[above0=="TRUE"])
+filtered <- cts.adj[above0,]
+max(colSums(filtered))/min(colSums(filtered))
+
+filtered <- as.matrix(filtered)
+blindvst <- varianceStabilizingTransformation(round(filtered), blind=TRUE, fitType = "parametric")
+max(colSums(blindvst))/min(colSums(blindvst))
+dim(blindvst)
+
+options(stringsAsFactors = FALSE)
+dim(blindvst)
+vstExpr0 = as.data.frame(t(blindvst))
+colnames(vstExpr0) = rownames(blindvst) 
+rownames(vstExpr0) = colnames(blindvst)
+dim(vstExpr0)
+
+gsg = goodSamplesGenes(vstExpr0, verbose = 3)
+gsg$allOK
+
+if (!gsg$allOK)
+{
+    full_expr = vstExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+if (gsg$allOK)
+{
+  full_expr = vstExpr0
+}
+dim(full_expr)
+all.equal(rownames(full_expr),rownames(vstExpr0)) #check they all stayed
+
+sampleTree = hclust(dist(full_expr), method = "average")
+plot(sampleTree, main = "Figure S2", sub="", xlab="", cex.lab = 1,
+    cex.axis = 1, cex.main = 1)
+#dev.copy2pdf(file = "../../3_output/1_MASTERS_WGCNA/Dendrograms/AllSamples.pdf", width = 12, height = 9);
+```
+
+For WGCNA Prediction and WGCNA Plasticity, we will perform batch adjustment on the appropriate data separately.
+
+### Adjust Basal Only
+```{r prepare cts and batch key for basal only}
+cts_basal <- cts.updated[str_detect(names(cts.updated),"_1$")] #end in 1
+cts_basal <- cts_basal %>% 
+  dplyr::select(pheno.wide$SeqID_w0) #put in right order
+
+cts_basal.mat <- as.matrix(cts_basal)
+rownames(pheno.wide) <- pheno.wide$SeqID_w0
+all(names(cts_basal.mat) == rownames(pheno.wide))
+dim(cts_basal.mat)
+```
+```{r run combat seq}
+pheno.wide <- pheno.wide %>% 
+  mutate(SeqID = ifelse(SubjectID == "UKMET05","5_1",SeqID),
+         SeqID = ifelse(SubjectID == "UKMET08","8_1",SeqID))
+
+batch.basal <- pheno.wide$Batch
+covar.mod.basal <- model.matrix(~as.factor(Sex), data = pheno.wide) #establishes reference
+
+#basal_combat_adj <- ComBat_seq(cts_basal.mat, batch = batch.basal, group = NULL, covar_mod = covar.mod.basal)
+dim(basal_combat_adj)
+```
+
+```{r filter basal adjusted eset}
+basal_cts.adj <- as.data.frame(basal_combat_adj)
+#For this function we use rowSums to determine characteristics of the gene (i.e., row)
+genesums <- vector(length=nrow(basal_cts.adj))
+for (i in 1:length(genesums)){
+  genesums[i] <- rowSums(basal_cts.adj[i,])
+}
+above0 <- genesums > 0
+length(above0[above0=="TRUE"])
+filt_basal <- basal_cts.adj[above0,]
+max(colSums(filt_basal))/min(colSums(filt_basal))
+```
+This reduces the number of genes from 58721 to 37891, but there is still a 4.1-fold difference in library size.
+
+```{r normalize basal set}
+filt_basal <- as.matrix(filt_basal)
+basal_set <- varianceStabilizingTransformation(round(filt_basal), 
+                                               blind=TRUE, fitType = "parametric")
+max(colSums(basal_set))/min(colSums(basal_set))
+dim(basal_set)
+```
+
+```{r transpose basal counts}
+options(stringsAsFactors = FALSE)
+dim(basal_set)
+basal_expr = as.data.frame(t(basal_set))
+colnames(basal_expr) = rownames(basal_set) 
+rownames(basal_expr) = colnames(basal_set)
+dim(basal_expr)
+```
+
+Now we can clean the data set by removing genes that don't have detectable expression.
+```{r ID Genes for Filtering}
+gsg = goodSamplesGenes(basal_expr, verbose = 3)
+gsg$allOK
+```
+
+```{r Filtering basal}
+if (!gsg$allOK)
+{
+    basal_expr = basal_expr[gsg$goodSamples, gsg$goodGenes]
+}
+if (gsg$allOK)
+{
+  basal_expr = basal_expr
+}
+dim(basal_expr)
+```
+### Adjust Paired Only
+```{r prepare cts and batch key for paired only}
+#ID people with both timepoints
+cts_paired <- cts[,names(cts) %in% pheno.long.paired$SeqID]
+
+cts_paired <- cts_paired %>% 
+  dplyr::select(pheno.long.paired$SeqID) #put in right order
+cts_paired.mat <- as.matrix(cts_paired)
+rownames(pheno.long.paired) <- pheno.long.paired$SeqID
+all(names(cts_paired.mat) == rownames(pheno.long.paired))
+dim(cts_paired.mat)
+```
+
+```{r run combat seq on paired}
+batch.paired <- pheno.long.paired$Batch
+covar.mod.paired <- model.matrix(~as.factor(Sex), data = pheno.long.paired) #establishes reference
+
+#paired_combat_adj <- ComBat_seq(cts_paired.mat, batch = batch.paired, group = NULL, covar_mod = covar.mod.paired)
+dim(paired_combat_adj)
+```
+
+```{r ID Genes with Low Expression for paired}
+paired_cts.adj <- as.data.frame(paired_combat_adj)
+
+genesums <- vector(length=nrow(paired_cts.adj))
+for (i in 1:length(genesums)){
+  genesums[i] <- rowSums(paired_cts.adj[i,])
+}
+above0 <- genesums > 0
+length(above0[above0=="TRUE"])
+filt_paired <- paired_cts.adj[above0,]
+max(colSums(filt_paired))/min(colSums(filt_paired))
+```
+This reduces the number of genes from 58721 to 39730, but there is still a 2.8-fold difference in library size.
+
+Out of curiosity, how many are the same in the lists?
+```{r identify overlap}
+nrow(filt_paired[rownames(filt_paired) %in% rownames(filt_basal),])
+```
+
+```{r normalize paired}
+filt_paired <- as.matrix(filt_paired)
+paired_set <- varianceStabilizingTransformation(round(filt_paired), blind=TRUE, 
+                                                fitType = "parametric")
+max(colSums(paired_set))/min(colSums(paired_set))
+dim(paired_set)
+```
+
+```{r Transpose VST Counts for paired}
+options(stringsAsFactors = FALSE)
+dim(paired_set)
+paired_expr = as.data.frame(t(paired_set))
+colnames(paired_expr) = rownames(paired_set) 
+rownames(paired_expr) = colnames(paired_set)
+dim(paired_expr)
+```
+
+Now we can clean the data set by removing genes that don't have detectable expression.
+```{r ID Genes for Filtering for paired}
+gsg = goodSamplesGenes(paired_expr, verbose = 3)
+gsg$allOK
+```
+
+```{r Filtering paired}
+if (!gsg$allOK)
+{
+    paired_expr = paired_expr[gsg$goodSamples, gsg$goodGenes]
+}
+if (gsg$allOK)
+{
+  paired_expr = paired_expr
+}
+dim(paired_expr)
+all.equal(rownames(paired_expr),rownames(paired_expr))
+```
+
+# Running Pipelines
+## WGCNA - Basal Only
+Soft-thresholding power was determined to be 12 for both paired and baseline networks based on code below.
+```{r basal approach, eval = FALSE}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+# Call the network topology analysis function
+sft = pickSoftThreshold(basal_expr, powerVector = powers, verbose = 5)
+
+#Plot the results:
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+    labels=powers,cex=0.9,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90,col="red")
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+    xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+    main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=0.9,col="red")
+```
+
+We will apply biweight mid correlation to reduce the influence of outliers. 
+```{r basal net construction, eval=FALSE}
+basal_network <- blockwiseModules(basal_expr, power = 12, maxBlockSize = 40000,
+                        deepSplit = 4,  pamStage = TRUE,
+                        corType = "bicor",  
+                        networkType = "signed",
+                        minModuleSize = 30,
+                        reassignThreshold = 0, mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        saveTOMs = FALSE,
+                        saveTOMFileBase = "TOMS",
+                        verbose = 3)
+```
+
+## WGCNA - Paired Only
+```{r paired approach, eval=FALSE}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+# Call the network topology analysis function
+sft = pickSoftThreshold(paired_expr, powerVector = powers, verbose = 5)
+
+#Plot the results:
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+    labels=powers,cex=0.9,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90,col="red")
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+    xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+    main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=0.9,col="red")
+```
+```{r paired network construction, eval = FALSE}
+paired_network <- blockwiseModules(paired_expr, power = 12, maxBlockSize = 40300,
+                        deepSplit = 4,  pamStage = TRUE,
+                        corType = "bicor", 
+                        networkType = "signed",
+                        minModuleSize = 30,
+                        reassignThreshold = 0, mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        saveTOMs = FALSE,
+                        saveTOMFileBase = "TOMS",
+                        verbose = 3)
+```
+
+## PLIER - all data
+Unlike WGCNA, PLIER is run across all samples. See Figure 1 and/or text for details.
+```{r bring in adjusted data for PLIER}
+options(stringsAsFactors=FALSE)
+expression_data <- combat_adj #use batch adjusted data
+
+dim(expression_data)
+head(colnames(expression_data)) #make sure that these are the sample names
+```
+
+Provide phenotype data. 
+```{r subject data}
+subject_data <- pheno.long
+
+subject_data <- subject_data %>% 
+  mutate(Timepoint = as.factor(Timepoint),
+         Batch = as.factor(Batch),
+         Sex = as.factor(Sex)) 
+#check to make sure that it is compatible with the gene expression data.
+all(subject_data$SeqID %in% colnames(expression_data))
+```
+
+```{r create list to work with gene data}
+dge <- DGEList(counts = expression_data)
+
+# filtering and normalization}
+keep <- rowSums(cpm(dge) > 0.5) >= 2
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge <- calcNormFactors(dge)
+
+# obtain z-score}
+z <- cpm(dge, log=TRUE)
+dim(z)
+```
+
+```{r filter gene file for highest expression}
+z.means <- rowMeans(z)
+
+rownames(gene_df) <- gene_df$link
+gene <- gene_df[rownames(z),]
+
+#map from ensembl ID to gene name
+#this function applies a function to each item in 1:nrow(z) to find the location of the maximum value
+ensembl_to_gene <- tapply(1:nrow(z),gene$gene_name,function(i){
+    i[which.max(z.means[i])]})
+
+y <- z[ensembl_to_gene,]
+rownames(y) <- names(ensembl_to_gene)
+```
+
+```{r load pathways}
+#load in canonical pathways for PLIER to read from
+data(bloodCellMarkersIRISDMAP)
+data(canonicalPathways)
+load("../0_data/MetaMEx_matrix.Rds")
+load("../0_data/FiberType_matrix.Rds")
+
+ncol(combinePaths(bloodCellMarkersIRISDMAP, canonicalPathways))
+ncol(MetaMEx_matrix)
+ncol(FiberType_matrix)
+
+#pool them
+allPaths <- combinePaths(bloodCellMarkersIRISDMAP, canonicalPathways, MetaMEx_matrix, FiberType_matrix)
+
+#let's look at allPaths to understand it
+dim(allPaths)
+tail(colnames(allPaths)) #these are canonical pathways
+head(rownames(allPaths)) #these are genes
+```
+
+```{r prepare gene and pathway sets}
+#find genes in the pathways that are in our filtered data set
+cm.genes <- commonRows(allPaths,y)
+length(cm.genes) #7817
+
+#normalize expression
+yN <- rowNorm(y)
+
+#compute principal components
+num.pc(yN) #18
+```
+We set k to 25 based on guidance from the developers of PLIER to apply ~1.5x num.pc.
+
+PLIER will generate key matrices that are coded by letters:
+Z: genes x LVs ("the loadings")
+B: LVs x samples ("the scores")
+  
+```{r run PLIER}
+yN.svd <- svd(yN[cm.genes,])
+Chat <- computeChat(allPaths[cm.genes,])
+
+#MASplierResult <- PLIER(yN[cm.genes,], allPaths[cm.genes,],k=25, svdres=yN.svd, Chat=Chat)
+load("../../2_pipeline/2_MASTERS_PLIER/MASplierResult.Rdata")
+```
+
+## PLIER Sensitivity Check
+As described in Methods, we reran PLIER without Subjects P_36 and P_012. This was because we found that LVs driven by these two subjects were consistently not robust to sensitivity checks, and the impact of this extended into our WGCNA/PLIER cross-analysis. Thus, PLIER is performed again below without the four samples (both pre and post) for these subjects, i.e., n = 49.
+The resulting LVs were used to annotate the lists. 
+```{r bring in adjusted data}
+expression_data <- as.data.frame(combat_adj) %>% 
+  dplyr::select(-contains("P_36_"), -contains("P_012_"))
+
+dim(expression_data)
+head(colnames(expression_data))
+```
+
+```{r fix subject data to be same samples}
+subject_data <- pheno.long %>% 
+  filter(SeqID %in% colnames(expression_data))
+
+subject_data <- subject_data %>% 
+  mutate(Timepoint = as.factor(Timepoint),
+         Batch = as.factor(Batch),
+         Sex = as.factor(Sex))
+dim(subject_data)
+```
+
+Check to make sure that it is compatible with the gene expression data.
+```{r prepare PLIER to run with n of 49}
+#check using rownames
+all(rownames(subject_data) %in% colnames(expression_data))
+
+dge <- DGEList(counts = expression_data)
+
+keep <- rowSums(cpm(dge) > 0.5) >= 2
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge <- calcNormFactors(dge)
+
+z <- cpm(dge, log=TRUE)
+z.means <- rowMeans(z)
+
+rownames(gene_df) <- gene_df$link
+gene <- gene_df[rownames(z),]
+
+#map from ensembl ID to gene name
+#this function applies a function to each item in 1:nrow(z) to find the location of the maximum value
+ensembl_to_gene <- tapply(1:nrow(z),gene$gene_name,function(i){
+    i[which.max(z.means[i])]})
+
+y <- z[ensembl_to_gene,]
+rownames(y) <- names(ensembl_to_gene)
+```
+
+###Figure 2
+```{r run PLIER with n of 49}
+#find genes in the pathways that are in our filtered data set
+cm.genes <- commonRows(allPaths,y)
+length(cm.genes) 
+
+#normalize expression
+yN <- rowNorm(y)
+
+#compute principal components
+num.pc(yN) #19
+
+yN.svd <- svd(yN[cm.genes,])
+Chat <- computeChat(allPaths[cm.genes,])
+
+#MASplier_updated <- PLIER(yN[cm.genes,], allPaths[cm.genes,],k=25, svdres=yN.svd, Chat=Chat)
+load("../../2_pipeline/2_MASTERS_PLIER/MASplier_updated.Rdata")
+plotU(MASplier_updated, auc.cutoff = 0.50, fdr.cutoff = 0.05, top = 5)
+```
+
+# Prediction Network Analysis
+## WGCNA
+###Basal Network Characteristics
+These are useful to run in order to understand how the network was constructed. Additionally, items created in this chunk are used in later analysis.
+```{r look at basal network}
+load(file="../../2_pipeline/1_MASTERS_WGCNA/store/TEMP_basal_network.Rdata")
+table(basal_network$colors)
+table(labels2colors(basal_network$colors))
+
+mergedColors = labels2colors(basal_network$colors)
+
+for (i in 1:length(basal_network$dendrograms))
+{
+    plotDendroAndColors(basal_network$dendrograms[[i]], mergedColors[basal_network$blockGenes[[i]]],
+                  "Module colors",
+                  dendroLabels = FALSE, hang = 0.03,
+                  addGuide = TRUE, guideHang = 0.05)
+}
+
+modLabels_basal = basal_network$colors
+modColors_basal = labels2colors(basal_network$colors)
+
+MEs_basal = moduleEigengenes(basal_expr, modColors_basal)$eigengenes
+MEs_basal = orderMEs(MEs_basal)
+
+geneTree_basal = basal_network$dendrograms[[1]]
+nGenes = ncol(basal_expr);
+nSamples = nrow(basal_expr);
+length(MEs_basal)
+```
+
+### Pearson Correlations to Phenotypes
+Prepare correlation matrix to look at primary outcome (CT) and secondary (DXA) for comparison.
+```{r prepare heatmap following reviewer response}
+nrow(resid.pheno.wide)==nrow(basal_expr) #good
+
+moduleTraitCor_basal = cor(MEs_basal, 
+                           resid.pheno.wide[,c("adj_d_CT_area","adj_delta_bilateral_thigh_normalized")], use="p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor_basal, nSamples = nrow(basal_expr));
+#check for column names to make sure I am selecting the correct traits of interest
+```
+
+####Figure 3
+```{r prediction heatmap, fig.height = 8, fig.width = 8, fig.align = "center"}
+sizeGrWindow(8,8)
+
+# Will display correlations and their p-val
+textMatrix = signif(moduleTraitPvalue, 1);
+textMatrix = paste(signif(moduleTraitCor_basal, 1), " (", signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor_basal)
+par(mar = c(12, 8, 3, 2));
+
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor_basal,
+             xLabels = c("change in mid-thigh muscle area (CT)","change in bilateral thigh mass (DEXA)"),
+             yLabels = names(MEs_basal),
+             ySymbols = names(MEs_basal),
+             colorLabels = FALSE,
+             colors = blueWhiteRed(100),
+             textMatrix = textMatrix,
+             setStdMargins = FALSE,
+             cex.text = 0.5,
+             cex.lab.x = 0.5,
+             cex.lab.y = 0.5,
+             xLabelsAdj = 1,
+             zlim = c(-1,1))
+             #main = "Change in Muscle Phenotype vs. Basal ME")
+             #verticalSeparator.x = c(4,7), verticalSeparator.col = "white", verticalSeparator.lwd = 10))
+```
+Let's also examine connections to myofiber CSA, an exploratory hypertrophy comparison. This is Figure S4A:
+```{r Figure S4A, fig.height = 8, fig.width = 8, fig.align = "center"}
+nrow(resid.pheno.wide)==nrow(basal_expr) #good
+
+moduleTraitCor_basal = cor(MEs_basal, 
+                           resid.pheno.wide[,c("adj_d_CT_area","adj_delta_bilateral_thigh_normalized",
+                                      "adj_d_myofiber_CSA")], use="p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor_basal, nSamples = nrow(basal_expr));
+#check for column names to make sure I am selecting the correct traits of interest
+
+sizeGrWindow(8,8)
+textMatrix = signif(moduleTraitPvalue, 1);
+textMatrix = paste(signif(moduleTraitCor_basal, 1), " (", signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor_basal)
+par(mar = c(12, 8, 3, 2));
+
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor_basal,
+             xLabels = c("change in mid-thigh muscle area (CT)","change in bilateral thigh mass (DXA)", "change in myofiber CSA"),
+             yLabels = names(MEs_basal),
+             ySymbols = names(MEs_basal),
+             colorLabels = FALSE,
+             colors = blueWhiteRed(100),
+             textMatrix = textMatrix,
+             setStdMargins = FALSE,
+             cex.text = 0.5,
+             cex.lab.x = 0.5,
+             cex.lab.y = 0.5,
+             xLabelsAdj = 1,
+             zlim = c(-1,1))
+             #main = "Change in Muscle Phenotype vs. Basal ME")
+             #verticalSeparator.x = c(4,7), verticalSeparator.col = "white", verticalSeparator.lwd = 10))
+```
+
+Apply p filtering cutoff to establish connections of interest
+```{r id mods of interest}
+#calculate new p threshold using Bonferroni adjustment for n modules
+p.threshold <- 0.05/(length(MEs_basal)-1) #do not penalize for grey module (leftovers)
+
+#modules with correlation p values below adjusted threshold
+IDmods <- as.data.frame(moduleTraitPvalue) %>% 
+  filter((adj_delta_bilateral_thigh_normalized <= p.threshold) |
+           (adj_d_CT_area <= p.threshold) | (adj_d_myofiber_CSA <= p.threshold))
+
+#modules with correlation p values below unadjusted p <0.05
+nominal.mods <-  as.data.frame(moduleTraitPvalue) %>% 
+  filter((adj_delta_bilateral_thigh_normalized <= 0.05) |
+           (adj_d_CT_area <= 0.05) | (adj_d_myofiber_CSA <= 0.05))
+
+#bring them together
+mods_of_interest <- str_sub(unique(c(rownames(IDmods), rownames(nominal.mods))),3) #drop the ME
+nominal.mods
+```
+
+Table S1 shows sizes (n genes) and mean module membership for Prediction WGCNA modules. 
+```{r create basal module table}
+basal_mod_table <- ModuleTable(basal_expr, basal_network, modColors_basal)
+
+basal_mod_table <- basal_mod_table %>% 
+  rownames_to_column(var="module") 
+#write.csv(basal_mod_table,"../5_manuscript/Supplements/Tables/prediction_WGCNA_module_table.csv")
+```
+
+###  Integrity and Senstivity Checks
+Table S2. The same is done for other modules of interest by passing the module color and trait of interest to the homemade "createTablefor" function.
+```{r red module}
+#createTablefor(module = "red", ExprSet = basal_expr, modColors = modColors_basal, trait = resid.pheno.wide$adj_d_CT_area)
+
+basal_red <- read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/redGeneTable.csv")
+```
+
+```{r create reference data frame for interesting connections}
+mods_of_interest <- as.data.frame(mods_of_interest) 
+names(mods_of_interest) = "module"
+mods_of_interest$trait <- c("adj_d_CT_area", "adj_d_myofiber_CSA","adj_d_CT_area")
+traits_of_interest <- resid.pheno.wide
+mods_of_interest
+```
+###Mean Module Gene Expression vs. Trait
+These plots are presented in Figures 5A, 6A, and S4B.
+```{r create data frame}
+basal_avg_expr <- moduleEigengenes(basal_expr, modColors_basal)
+avg_expr <- basal_avg_expr$averageExpr
+all(str_sub(names(avg_expr),3) %in% modColors_basal)
+
+basal_avg_expr <- avg_expr %>% 
+  rownames_to_column(var="SeqID_w0")
+plotWGCNA <- full_join(resid.pheno.wide, basal_avg_expr, by = "SeqID_w0")
+
+mods_of_interest_AE <- mods_of_interest %>% 
+  mutate(module = str_c("AE", module))
+
+for (i in 1:nrow(mods_of_interest)){
+  print(ggplot(plotWGCNA) + geom_point(mapping=aes(x=plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$module[i]],
+                           y=plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$trait[i]]),
+               color=str_sub(mods_of_interest_AE$module[i],3), size = 5) +
+    geom_smooth(mapping=aes(x=plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$module[i]],
+                            y=plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$trait[i]]), method = "lm", colour = "black")+
+    scale_y_continuous(name = mods_of_interest_AE$trait[i]) + 
+    scale_x_continuous(name = mods_of_interest_AE$module[i]) +
+    theme_classic()+
+    theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")))
+  #ggsave(filename = paste0("../../3_output/1_MASTERS_WGCNA/Scatterplots/basal/",str_sub(mods_of_interest_AE$module[i],3),
+                           #"_",mods_of_interest_AE$trait[i],".pdf"), width = 6, height = 3.5)
+}
+```
+
+The values presented in figure legends are generated below.
+```{r calculate R value for red magenta salmon}
+red_CT <- lm(data=plotWGCNA, plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$module[1]] ~
+     plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$trait[1]])
+summary(red_CT)
+
+magenta_CT <- lm(data=plotWGCNA, plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$module[2]] ~
+     plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$trait[2]])
+summary(magenta_CT)
+
+salmon_fCSA <- lm(data=plotWGCNA, plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$module[3]] ~
+     plotWGCNA[,names(plotWGCNA)==mods_of_interest_AE$trait[3]])
+summary(salmon_fCSA)
+```
+
+Let's drop the extreme points for these and ensure they are upheld.
+```{r test  module sensitivity for Prediction modules}
+prediction_sens_check <- plotWGCNA %>% 
+  filter(AEred<= mean(plotWGCNA$AEred)+3*sd(plotWGCNA$AEred) &
+           AEred>= mean(plotWGCNA$AEred)-3*sd(plotWGCNA$AEred))
+AEred.fit <- lm(data = prediction_sens_check, AEred ~adj_d_CT_area)
+summary(AEred.fit)
+
+prediction_sens_check <- plotWGCNA %>% 
+  filter(AEmagenta<= mean(plotWGCNA$AEmagenta)+3*sd(plotWGCNA$AEmagenta) &
+           AEmagenta>= mean(plotWGCNA$AEmagenta)-3*sd(plotWGCNA$AEmagenta))
+AEmagenta.fit <- lm(data = prediction_sens_check, AEmagenta ~adj_d_CT_area)
+summary(AEmagenta.fit)
+
+prediction_sens_check <- plotWGCNA %>% 
+  filter(AEsalmon<= mean(plotWGCNA$AEsalmon)+3*sd(plotWGCNA$AEsalmon) &
+         AEsalmon>= mean(plotWGCNA$AEsalmon)-3*sd(plotWGCNA$AEsalmon))
+AEsalmon.fit <- lm(data = prediction_sens_check, AEsalmon ~adj_d_myofiber_CSA)
+summary(AEsalmon.fit)
+```
+We see that it's upheld without the extremely high point. Based on the figures for magenta and salmon, I don't really see an extreme data point that we might suppose is driving the module-trait effect.
+
+###Figures 5B, 6B, and S4C
+```{r intramodular scatterplot, eval = FALSE}
+for (i in 1:nrow(mods_of_interest)){
+    createTablefor(module = mods_of_interest$module[i], ExprSet = basal_expr, modColors = modColors_basal, 
+                   #trait = traits_of_interest[,names(traits_of_interest)==mods_of_interest$trait[i]], 
+                   #filepath = "/data/project/bamman-lab/MASTERS/00_preliminary/prelim_pipeline_development/WGCNA/")
+    createPlotfor(module = mods_of_interest$module[i], ExprSet = basal_expr, Network = basal_network,
+                  modColors = modColors_basal, 
+                  trait = traits_of_interest[,names(traits_of_interest)==mods_of_interest$trait[i]],
+                  filepath = "/data/project/bamman-lab/MASTERS/3_output/1_MASTERS_WGCNA/Scatterplots/basal/")
+}
+```
+
+### Intramodular Analysis
+Topological Overlap Matrix run as job in UAB Cheaha (09.24.2020).
+```{r create TOMS, eval = FALSE}
+#basal_TOM = TOMsimilarityFromExpr(basal_expr, power = 12)
+load(file="../../2_pipeline/1_MASTERS_WGCNA/store/basal_TOM.Rdata")
+```
+
+```{r load toms for basal, eval = FALSE}
+modules_to_pursue <- str_sub(mods_of_interest$module)
+for (i in 1:length(modules_to_pursue)){
+  filepath <- str_c("../../3_output/1_MASTERS_WGCNA/GeneDetails/",
+                    modules_to_pursue[i],"_module_details.csv", sep = "")
+  x <- paste(modules_to_pursue[i],"_module_details",sep="") 
+  assign(x,read.csv(file=filepath, header = TRUE, row.names = 1))
+}
+
+getCytoscape(module = "red", detailTable = red_module_details, modColors = modColors_basal,
+             ExprSet = basal_expr, fraction = "quadrant_4", TOM_matrix = basal_TOM)
+getCytoscape(module = "salmon", detailTable = salmon_module_details, modColors = modColors_basal,
+             ExprSet = basal_expr, fraction = "top_half", TOM_matrix = basal_TOM)
+getCytoscape(module = "magenta", detailTable = magenta_module_details, modColors = modColors_basal,
+             ExprSet = basal_expr, fraction = "quadrant_4", TOM_matrix = basal_TOM)
+```
+The cytoscape output was used to generate figures 5C, 6C, and S4D. 
+
+## PLIER
+```{r prepare subject data to integrate with PLIER}
+simpledf <- subject_data %>% 
+  mutate(Paired = ifelse(SeqID %in% pheno.long.paired$SeqID,1,0), 
+         TimePoint = as.factor(ifelse(Paired==0&Timepoint==1,"1",ifelse(Paired==1&Timepoint==1,"2","3")))) %>% 
+  dplyr::select("SeqID","TimePoint","Sex", "Batch") %>% 
+  arrange(TimePoint, Sex, Batch)
+
+newyN <- yN[,match(rownames(simpledf), colnames(yN))]
+
+all.equal(rownames(simpledf),colnames(newyN))
+```
+```{r check LVs on updated plier result}
+#load("../../2_pipeline/2_MASTERS_PLIER/MASplier_updated.Rdata")
+
+subject_data <- pheno.long %>% 
+  filter(SeqID %in% colnames(MASplier_updated$B))
+
+#adjusted normalized values
+adj.vars.of.interest <- c("adj_bilateral_thigh_mass_normalized", "adj_avg_area", "adj_Avg_CSA")
+#change <- resid.pheno.wide %>% 
+  #filter(SeqID %in% subject_data$SeqID) %>% 
+  #dplyr::select(SeqID, any_of(adj.vars.of.interest))
+
+#adjusted deltas
+predict <- resid.pheno.wide %>% 
+  filter(SeqID_w0 %in% subject_data$SeqID) %>% 
+  dplyr::select(SeqID_w0, adj_delta_bilateral_thigh_normalized, adj_d_CT_area, adj_d_myofiber_CSA) %>% 
+  rename("SeqID" = "SeqID_w0")
+
+pathdata_updated <- as.data.frame(t(MASplier_updated$B)) %>% 
+  rownames_to_column(var = "SeqID") %>% 
+  mutate(Sex = subject_data$Sex[match(SeqID, subject_data$SeqID)],
+         TimePoint = subject_data$Timepoint[match(SeqID, subject_data$SeqID)],
+         ExerciseEffect = ifelse(!SeqID %in% pheno.long.paired$SeqID,NA,TimePoint)) %>% 
+  #left_join(change, by ="SeqID") %>%
+  left_join(predict, by = "SeqID") %>% 
+  column_to_rownames(var = "SeqID")
+   
+for (i in 1:nrow(MASplier_updated$B)){
+  colnames(pathdata_updated)[i] <- paste(c("LV",i),collapse = "")
+}
+pathdata_updated
+```
+
+### Linear Models to Test Prediction
+The information here is used to create Table 2. 
+```{r prediction effect lm}
+pathdata_updated_predict <- pathdata_updated %>% 
+  filter(!is.na(adj_d_CT_area)) #29
+
+signifTable_predict_updated <- as.data.frame(matrix(nrow = nrow(MASplier_updated$B))) %>%
+  mutate(LV = rownames(MASplier_updated$B),adj_delta_bilateral_thigh_normalized = NA, 
+         adj_d_CT_area = NA, adj_d_myofiber_CSA = NA) %>% 
+  dplyr::select(-V1)
+
+for(i in 1:25){
+  j = pathdata_updated_predict[,i]
+  fit1 <- lm(data = pathdata_updated_predict, formula = j ~ adj_delta_bilateral_thigh_normalized)
+  signifTable_predict_updated$adj_delta_bilateral_thigh_normalized[i]=round(summary(fit1)[["coefficients"]][2,4], digits=4)
+  
+  fit2 <- lm(data = pathdata_updated_predict, formula = j ~ adj_d_CT_area)
+  signifTable_predict_updated$adj_d_CT_area[i]=round(summary(fit2)[["coefficients"]][2,4], digits=4)
+
+  fit3 <- lm(data = pathdata_updated_predict, formula = j ~ adj_d_myofiber_CSA)
+  signifTable_predict_updated$adj_d_myofiber_CSA[i]=round(summary(fit3)[["coefficients"]][2,4], digits=4)
+}
+
+LVs_of_interest_prediction_updated <- signifTable_predict_updated %>%
+  filter(adj_delta_bilateral_thigh_normalized <= 0.05 |
+         adj_d_CT_area <= 0.05 |
+         adj_d_myofiber_CSA <= 0.05) %>% 
+  mutate(LVid = str_extract(LV, pattern="[:digit:]{1,}")) 
+ 
+#present it in a sparse fashion to make it easier to look at table
+LVs_of_interest_prediction_updated %>% 
+  mutate(adj_delta_bilateral_thigh_normalized  = ifelse(adj_delta_bilateral_thigh_normalized<0.05,
+                                                        round(adj_delta_bilateral_thigh_normalized,3), NA),
+         adj_d_CT_area = ifelse(adj_d_CT_area<0.05, round(adj_d_CT_area,3), NA),
+         adj_d_myofiber_CSA = ifelse(adj_d_myofiber_CSA<0.05, round(adj_d_myofiber_CSA,3), NA)) %>% 
+  relocate(LVid) 
+```
+These are all candidates for follow up. Those that pass the sensitivity checks will be presented.
+
+#### Figure 7A
+```{r figure 7A}
+ggplot(pathdata_updated_predict) +
+  geom_point(mapping=aes(x=LV7,y=adj_d_CT_area),colour="black", size = 3) +
+  geom_smooth(mapping=aes(x=LV7,y=adj_d_CT_area), method = "lm", colour = "black") +
+  scale_y_continuous(name = "adj_d_CT_area") + 
+  scale_x_continuous(name = "LV7") +
+  theme_classic()+
+  theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")) 
+
+lv7fit <- lm(data=pathdata_updated_predict, LV7 ~ adj_d_CT_area)
+summary(lv7fit)
+```
+### Continuous Heatmaps
+```{r look at the available data}
+vars.of.interest <- c("adj_delta_bilateral_thigh_normalized","adj_d_CT_area","adj_d_myofiber_CSA")
+continuousdf <- resid.pheno.wide %>% 
+  dplyr::select("SubjectID","SeqID_w0","Batch", any_of(vars.of.interest)) %>% 
+  filter(SeqID_w0 %in% colnames(as.data.frame(MASplier_updated$B))) %>% #make sure we use same samples
+  mutate(Batch = ifelse(SubjectID=="UKMET08",3,Batch),
+         Batch = ifelse(SubjectID=="UKMET05",3,Batch)) %>% 
+  column_to_rownames(var = "SeqID_w0") 
+```
+We ran continuous heatmaps for all the PLIER LVs in order to visualize the relationship with the change in CT, DEXA, and fCSA. Below is the code, drawing from the customplotTopZcontinuous function
+```{r try function for continuous heatmap, eval = FALSE}
+for (i in 1:nrow(MASplier_updated$B)){
+  filedir <- paste0("../../3_output/2_MASTERS_PLIER/SensitivityCheck/Heatmaps/DXA_basal/continuous_heatmaps_DXA",i,".pdf")
+  customplotTopZcontinuous(plierRes = MASplier_updated, variable = vars.of.interest[1],
+                         priorMat = allPaths, top = 50, index = i, regress = FALSE, allLVs = TRUE,
+                         width = 15, height = 10, filename=filedir)
+}
+for (i in 1:nrow(MASplier_updated$B)){
+  filedir <- paste0("../../3_output/2_MASTERS_PLIER/SensitivityCheck/Heatmaps/CT_basal/continuous_heatmaps_CT",i,".pdf")
+  customplotTopZcontinuous(plierRes = MASplier_updated, variable = vars.of.interest[2],
+                         priorMat = allPaths, top = 50, index = i, regress = FALSE, allLVs = TRUE,
+                         width = 15, height = 10, filename=filedir)
+}
+for (i in 1:nrow(MASplier_updated$B)){
+  filedir <- paste0("../../3_output/2_MASTERS_PLIER/SensitivityCheck/Heatmaps/fCSA_basal/continuous_heatmaps_fCSA",i,".pdf")
+  customplotTopZcontinuous(plierRes = MASplier_updated, variable = vars.of.interest[3],
+                         priorMat = allPaths, top = 50, index = i, regress = FALSE, allLVs = TRUE,
+                         width = 15, height = 10, filename=filedir)
+}
+```
+
+####Figure 7B
+I will show LV7 here, which is Figure 7B. 
+```{r example,fig.height = 8, fig.width = 8, fig.align = "center"}
+customplotTopZcontinuous(plierRes = MASplier_updated, variable = "adj_d_CT_area",
+                         priorMat = allPaths, top = 50, index = 7, regress = FALSE, allLVs = TRUE,
+                         width = 15, height = 10)
+```
+
+### Sensitivity Checks for Prediction
+```{r plot prediction LVs}
+LVs_prediction <- as.data.frame(LVs_of_interest_prediction_updated$LVid) %>% 
+  rename("LV" = "LVs_of_interest_prediction_updated$LVid") %>% 
+  mutate(LV = as.numeric(LV)) %>% 
+  mutate(trait = c("adj_d_CT_area","adj_d_CT_area","adj_d_myofiber_CSA","adj_d_CT_area",
+                   "adj_delta_bilateral_thigh_normalized","adj_delta_bilateral_thigh_normalized","adj_d_CT_area"))
+#put them in manually because I couldn't figure out how to make it ID columns that have a value <0.05 for each row :(
+for (i in 1:nrow(LVs_prediction)){
+  print(ggplot(pathdata_updated_predict) +
+  geom_point(mapping=aes(x=pathdata_updated_predict[,LVs_prediction$LV[i]],
+                         y=pathdata_updated_predict[,names(pathdata_updated_predict)==LVs_prediction$trait[i]]),
+             colour="black", size = 3) +
+  geom_smooth(mapping=aes(x=pathdata_updated_predict[,LVs_prediction$LV[i]],
+                          y=pathdata_updated_predict[,names(pathdata_updated_predict)==LVs_prediction$trait[i]]),
+              method = "lm", colour = "black") +
+  scale_y_continuous(name = LVs_prediction$trait[i]) + 
+  scale_x_continuous(name = str_c("LV",LVs_prediction$LV[i])) +
+  theme_classic()+
+  theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")))
+  }
+```
+
+```{r sensitivity checks for plier prediction}
+outlier_check<- as.data.frame(matrix(ncol = 6, nrow=25))
+names(outlier_check) <- c("LV","n","r_val_adj_d_CT_area","p_val_adj_d_CT_area",
+                          "r_val_adj_delta_bilateral_thigh_normalized","p_val_adj_delta_bilateral_thigh_normalized")
+
+for (i in 1:25){ 
+  name = str_c("LV",i) 
+  outlier_check$LV[i] = name
+  clean_path <- pathdata_updated_predict %>%  #drops anyone above and below 3 standard deviations
+    filter(pathdata_updated_predict[,name]<= mean(pathdata_updated_predict[,name])+
+             3*sd(pathdata_updated_predict[,name]) &
+           pathdata_updated_predict[,name]>= mean(pathdata_updated_predict[,name])-
+             3*sd(pathdata_updated_predict[,name]))
+  
+  outlier_check$n[i] <- nrow(clean_path) 
+  fit <- lm(data = clean_path, clean_path[,name] ~adj_d_CT_area)
+  outlier_check$r_val_adj_d_CT_area[i] <- round(summary(fit)$r.squared,3)
+  outlier_check$p_val_adj_d_CT_area[i] <- round(summary(fit)[["coefficients"]][2,4],3)
+  
+  fit2 <- lm(data = clean_path, clean_path[,name] ~adj_delta_bilateral_thigh_normalized)
+  outlier_check$r_val_adj_delta_bilateral_thigh_normalized[i] <- round(summary(fit2)$r.squared,3)
+  outlier_check$p_val_adj_delta_bilateral_thigh_normalized[i] <- round(summary(fit2)[["coefficients"]][2,4],3)
+}
+
+#present LVs that survive the check for CT and DXA; write to a variable so we can use it later
+LV_sensitivity_check <- outlier_check %>% 
+  filter(LV %in% str_c("LV",LVs_of_interest_prediction_updated$LVid)) %>% 
+  filter(p_val_adj_d_CT_area <.05 | p_val_adj_delta_bilateral_thigh_normalized<0.05)
+LV_sensitivity_check
+```
+Three are upheld for the CT comparison (LVs 7, 16, 23), and one for DXA (LV 19). These four, in total, are presented in Table 2 as PLIER Prediction LVs.
+
+Export the top 100 genes in these LVs of interest. These are Tables S5, 6, and 8.
+```{r generate LV tables, eval = FALSE}
+prediction_LVs <- LVs_of_interest_prediction_updated 
+
+CT_LVs <- prediction_LVs %>% 
+  filter(str_c("LV",LVid) %in% LV_sensitivity_check$LV,
+         adj_d_CT_area <= 0.05)
+
+for (i in 1:nrow(CT_LVs)){
+  LVtablemaker(MASplier_updated, newyN, allPaths, index = CT_LVs$LVid[i], top = 100, 
+               path = "../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/CT/")
+}
+```
+
+## Integration and Comparison of Pipelines 
+### Find Biological Annotations for Key Module Genes
+We use the mod_LV_check function to find the top association for the top LV that was associated with key module genes. These are appended to the gene information in Tables S2-4.
+```{r modLV check}
+updated_red_LV <- mod_LV_check(plierResult = MASplier_updated, genetable =
+                                 read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/redGeneTable.csv")) %>% 
+  mutate(pathway = gsub(".*,","",LV_path)) #condense because some LVs have the same pathway
+
+updated_red_LV %>% 
+  group_by(pathway) %>% 
+  summarise(n = length(geneID)) %>% 
+  arrange(-n)
+```
+Here we can see the number for each LV for the top genes in red. This is where it became apparent in the original analysis that the two outlying samples were driving more of the signatures seen in PLIER than they were for WGCNA. Above we see the corrected table, run with the n=49 samples in PLIER.
+
+We did the same thing for the other mods of interest.
+```{r show lv connections}
+magenta_LV_associations <- mod_LV_check(MASplier_updated, genetable =
+                                 read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/magentaGeneTable.csv"))
+salmon_LV_associations <- mod_LV_check(MASplier_updated, genetable =
+                                 read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/salmonGeneTable.csv"))
+```
+
+### Identify Overlaps in Predictive Networks
+For this, we will pool one outcome at a time. 
+
+#### CT
+```{r bring in CT LV files and compare to red magenta genes}
+for (i in 1:length(list.files("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/CT/"))){
+  name <- gsub("_.*","",list.files("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/CT/")[i])
+  j <- paste("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/CT/",
+             list.files("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/CT/")[i],sep="")
+  assign(name, read.csv(file = j))
+}
+
+all_CT_genes <- unique(c(LV7$X, LV16$X, LV23$X)) 
+
+#going to combine red and magenta since they both have a CT association
+red_gene_table <- read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/redGeneTable.csv")
+magenta_gene_table <- read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/magentaGeneTable.csv")
+
+red_magenta <- unique(c(red_gene_table$symbol, magenta_gene_table$symbol))
+
+IDoverlaps(all_CT_genes, red_magenta) #nothing
+```
+
+#### DEXA
+The top genes in LV19 are presented in Table S7.
+```{r dexa overlaps}
+DXA_LVs <- LV_sensitivity_check %>% 
+  filter(p_val_adj_delta_bilateral_thigh_normalized<=0.05)
+
+#LVtablemaker(MASplier_updated, newyN, allPaths, index = 19, top = 100,
+             #path = "/data/project/bamman-lab/MASTERS/3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/DXA/")
+```
+
+```{r look at dexa prediction overlaps with red and magenta}
+LV19 <- read.csv("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/DXA/LV19_table_Top100.csv")
+overlaps <- IDoverlaps(LV19$X, red_magenta) #3
+
+LV19 %>% 
+  filter(X %in% overlaps)
+```
+
+# Response Network Analysis
+## PLIER
+### Paired T-test to Test Responsiveness
+This code generates the middle column (i.e., Response) in manuscript Table 2.
+```{r exercise effect for sensitivity check}
+pathdata_updated.RT <- pathdata_updated %>% filter(!is.na(ExerciseEffect)) #40 rows is correct, 20 pairs
+
+signifTable_updated <- as.data.frame(matrix(nrow = nrow(MASplier_updated$B))) %>%
+  mutate(LV = rownames(MASplier_updated$B),p_RTeffect = NA, adj_p_RTeffect = NA) %>% 
+  dplyr::select(-V1)
+
+pathdata_updated.RT <- pathdata_updated %>% filter(!is.na(ExerciseEffect))
+
+for(i in 1:25){
+  ttest <- t.test(formula=pathdata_updated.RT[,i]~pathdata_updated.RT$TimePoint, paired=TRUE)
+  signifTable_updated$p_RTeffect[i]<- round(ttest$p.value, digits = 6)
+  signifTable_updated$adj_p_RTeffect[i] <- signifTable_updated$p_RTeffect[i]*25
+}
+
+LVs_of_interest_exercise_updated <- signifTable_updated %>%
+  filter(signifTable_updated$adj_p_RTeffect <= 0.05) %>% 
+  mutate(LVid = str_extract(LV, pattern="[:digit:]{1,}")) 
+
+LV_sensitivity_check_response <- LVs_of_interest_exercise_updated %>% 
+  relocate(LVid) %>% 
+  dplyr::select(-p_RTeffect) %>% 
+  mutate(adj_p_RTeffect = round(adj_p_RTeffect,3))
+LV_sensitivity_check_response
+```
+
+
+### Box Plots
+####Figure 8
+We can generate box plots for these using the PLIERbox function.
+```{r plot the six box plots}
+#condense all baseline into one category
+simpledf1 <- simpledf %>% 
+    rownames_to_column(var = "seqID") %>% 
+    mutate(PrePost = ifelse(simpledf$TimePoint==3,"Post-RT","Baseline"),
+           subjectID = str_sub(seqID,0,-3))
+
+for (i in 1:nrow(LVs_of_interest_exercise_updated)){
+  print(PlierBox(plierRes = MASplier_updated, index = as.numeric(LVs_of_interest_exercise_updated$LVid[i]), 
+        subject.data = simpledf1, group.var = "PrePost",paired = TRUE, subject.var = "subjectID"))
+}
+```
+
+```{r subset pathdata to look at only these 6}
+exercise <- as.numeric(LVs_of_interest_exercise_updated$LVid)
+examine_exercise <- as.data.frame(t(MASplier_updated$B[exercise,])) 
+
+names(examine_exercise) <- str_c("LV",LVs_of_interest_exercise_updated$LVid)
+```
+
+### Heatmaps 
+We create heatmaps for all LVs here. For LVs 8, 2, 6, and 15, the resulting plots are presented in Figures S5 and 6.
+```{r heatmap loop, eval = FALSE}
+for (i in 1:nrow(MASplier_updated$B)){
+  filedir <- paste0("../../3_output/2_MASTERS_PLIER/SensitivityCheck/Heatmaps/ExEffect/heatmap",i,".pdf")
+  customplotTopZ(plierRes = MASplier_updated, data = newyN, priorMat = allPaths, top = 50, index = i, allLVs = TRUE, 
+               annotation_col = simpledf, width = 15, height = 10, 
+               filename=filedir)
+}
+```
+
+#### Figure 9
+```{r figure 9a, fig.height = 9, fig.width = 10, fig.align="center"}
+simpledf$SeqID <- NULL
+customplotTopZ(plierRes = MASplier_updated, data = newyN, priorMat = allPaths, top = 50, index = 19, allLVs = TRUE, 
+               annotation_col = simpledf)
+```
+
+```{r figure 9b,  fig.height = 9, fig.width = 10, fig.align="center"}
+customplotTopZ(plierRes = MASplier_updated, data = newyN, priorMat = allPaths, top = 50, index = 25, allLVs = TRUE, 
+               annotation_col = simpledf)
+```
+### Response LV Tables
+The top 100 genes in the Response LVs (2, 6, 8, 15, 19, 25) are presented in Tables S9-14.
+```{r create tables for exercise LVs, eval = FALSE}
+for (i in 1:nrow(LVs_of_interest_exercise_updated)){
+  LVtablemaker(MASplier_updated, newyN, allPaths, index = as.numeric(LVs_of_interest_exercise_updated$LVid)[i], 
+               top = 100, path = "../5_manuscript/Supplements/Tables/")
+}
+```
+
+# Plasticity Network Analysis
+## WGCNA
+
+### Paired Network Characteristics
+Below, we examine the paired network, constructed from only participants with seq data at both time points. 
+```{r look at paired network}
+load(file="../../2_pipeline/1_MASTERS_WGCNA/store/TEMP_paired_network.Rdata")
+
+table(paired_network$colors)
+table(labels2colors(paired_network$colors))
+
+mergedColors = labels2colors(paired_network$colors)
+
+for (i in 1:length(paired_network$dendrograms))
+{
+    plotDendroAndColors(paired_network$dendrograms[[i]], mergedColors[paired_network$blockGenes[[i]]],
+                  "Module colors",
+                  dendroLabels = FALSE, hang = 0.03,
+                  addGuide = TRUE, guideHang = 0.05)
+}
+
+modLabels_paired = paired_network$colors
+modColors_paired = labels2colors(paired_network$colors)
+MEs_paired = moduleEigengenes(paired_expr, modColors_paired)$eigengenes
+MEs_paired = orderMEs(MEs_paired)
+
+geneTree_paired = paired_network$dendrograms[[1]]
+nGenes = ncol(paired_expr);
+nSamples = nrow(paired_expr);
+length(MEs_paired)
+```
+It has similar features to the baseline, in that most are in grey but turqouise is otherwise the largest.
+
+The module characteristics for the Plasticity analysis are shown in Table S16.
+```{r create plasticity module table}
+paired_mod_table <- ModuleTable(paired_expr, paired_network, modColors_paired) %>% 
+  rownames_to_column(var="module") 
+```
+
+### Module Change Index Calculation
+We can appreciate the variability in starting ME scores by plotting them and seeing how challenging it is to interpret.
+```{r try to plot it}
+resid.pheno.paired <- resid.pheno.paired %>% 
+  arrange(match(rownames(resid.pheno.paired),rownames(MEs_paired)))
+
+all.equal(rownames(resid.pheno.paired), rownames(MEs_paired)) 
+pheno.paired.ME <- cbind(resid.pheno.paired, MEs_paired)
+
+#an example
+ggplot(pheno.paired.ME) + 
+          geom_line(mapping = aes(x = Timepoint, y = MEpink, group = SubjectID), color = "pink") +
+          labs(y = "MEpink") + theme_bw()
+```
+
+```{r generate plots for all, eval = FALSE}
+for (i in 1:(length(MEs_paired)-1)){
+  module = names(pheno.paired.ME[ncol(pheno.long.paired) + i])
+  print(ggplot(pheno.paired.ME) + 
+          geom_line(mapping = aes(x = Timepoint, y = pheno.paired.ME[,module], 
+                                                   group = SubjectID), color = str_sub(module, 3)) +
+          labs(y = str_sub(module, 3)) + theme_bw()) 
+}
+```
+
+```{r calculate the change index}
+all.equal(row.names(resid.pheno.paired), rownames(MEs_paired))
+resid.pheno.paired.ME <- cbind(resid.pheno.paired, MEs_paired)
+
+adj.pheno.paired.ME <- resid.pheno.paired.ME %>% 
+  rownames_to_column(var = "SeqID") %>% 
+  dplyr::select("SubjectID","SeqID","Timepoint","Batch","Age","Sex","Treatment", 
+                contains("adj_"), starts_with("ME", ignore.case = FALSE)) %>% 
+  column_to_rownames(var = "SeqID")
+
+deltas <- adj.pheno.paired.ME %>% 
+  dplyr::select(SubjectID, Timepoint, starts_with("ME", ignore.case = FALSE)) %>% 
+  pivot_wider(id_cols = SubjectID, names_from = Timepoint, values_from = starts_with("ME", ignore.case = FALSE)) %>% 
+  column_to_rownames(var = "SubjectID")
+
+CBI <- data.frame(row.names =  rownames(deltas))
+j <- names(MEs_paired)
+
+for (i in 1:length(j)){
+  a <- str_c(j[i],"_1")
+  b <- str_c(j[i],"_3")
+  CBI[,str_c((j[i]),"_cbi")] <- 1-(deltas[,a]/deltas[,b])  
+}
+
+CBI <- CBI %>% 
+  rownames_to_column(var = "SubjectID")
+
+hist(CBI$MEblack_cbi) #just look at an example
+```
+
+```{r illustrate change index}
+#I think we have to go back to long
+CBI_long <- CBI %>% 
+  mutate(SeqID = MASTERSpheno$SeqID_w16[match(SubjectID, MASTERSpheno$SubjectID)])
+
+CBI_long2 <- CBI %>% #set pre to 0 based on 1-pre/pre
+  mutate(SeqID = MASTERSpheno$SeqID_w0[match(SubjectID, MASTERSpheno$SubjectID)]) %>% 
+  mutate_if(.predicate = str_detect(names(CBI_long), "^ME"), .funs = ~ (.x = 0)) 
+
+CBI_plot <- bind_rows(CBI_long2, CBI_long) %>% 
+  mutate(Timepoint = pheno.long.paired$Timepoint[match(SeqID, pheno.long.paired$SeqID)]) %>% 
+  column_to_rownames(var = "SeqID")
+
+ggplot(CBI_plot) + 
+  geom_line(mapping = aes(x = Timepoint, y = MEpink_cbi,group = SubjectID), color = "pink") +
+  labs(y = "pink_cbi") + theme_bw()
+```
+
+```{r generate change score plots for all, eval = FALSE}
+for (i in 2:(2+length(names(MEs_paired))-1)){
+  module = names(CBI_plot)[i]
+  print(ggplot(CBI_plot) + 
+          geom_line(mapping = aes(x = Timepoint, y = CBI_plot[,module], 
+                                                   group = SubjectID), color = str_sub(module,3,-5)) +
+          labs(y = str_sub(module, 3)) + theme_bw()) 
+}
+```
+
+### Pearson Correlations to Phenotype
+We are going to drop all the baselines which are essentially just adding zeros to the data set.
+```{r try to work with double changes}
+CBI_df <- CBI_long %>% 
+  dplyr::select(-SubjectID) %>% 
+  mutate(SeqID = str_c(str_sub(SeqID,0,-3),"_1",sep="")) %>% 
+  column_to_rownames(var = "SeqID")
+
+paired_change <- resid.pheno.wide %>% 
+  filter(SeqID_w0 %in% rownames(CBI_df)) %>% #22 people 
+  arrange(SeqID_w0 = match(SeqID_w0, rownames(CBI_df))) %>% 
+  column_to_rownames(var = "SeqID_w0") 
+  
+#check that it's compatible with the other data
+all.equal(rownames(CBI_df), rownames(paired_change))
+
+CBI_df <- CBI_df[rownames(CBI_df),]
+all.equal(rownames(CBI_df), rownames(paired_change))
+```
+```{r prepare for plasticity heatmap}
+nSamples = nrow(CBI_df)
+moduleTraitCor_paired = cor(CBI_df, 
+                           paired_change[,c("adj_d_CT_area", "adj_delta_bilateral_thigh_normalized",
+                                      "adj_d_myofiber_CSA")], use="p");
+moduleTraitPvalue_paired = corPvalueStudent(moduleTraitCor_paired, nSamples);
+```
+
+####Figure S7A
+```{r plasticity heatmap,fig.height = 8, fig.width = 8, fig.align = "center"}
+sizeGrWindow(8,8)
+textMatrix = paste(signif(moduleTraitCor_paired, 1), " (", signif(moduleTraitPvalue_paired, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor_paired)
+par(mar = c(12, 8, 3, 2));
+
+labeledHeatmap(Matrix = moduleTraitCor_paired,
+             xLabels = c("adjusted_change_area_CT","adjusted_change_DEXA",
+                                      "adj_change_fCSA"),
+             yLabels = names(MEs_paired),
+             ySymbols = names(MEs_paired),
+             colorLabels = FALSE,
+             colors = blueWhiteRed(100),
+             textMatrix = textMatrix,
+             setStdMargins = FALSE,
+             cex.text = 0.5,
+             cex.lab.x = 0.8,
+             cex.lab.y = 0.5,
+             cex.main = 0.8,
+             zlim = c(-1,1),
+             main = "Change in Muscle Phenotype vs. ME Change Indices")
+```
+
+```{r id mods of interest for predictive}
+p.threshold <- 0.05/(length(MEs_paired)-1) #do not penalize for grey module
+
+IDmods <- as.data.frame(moduleTraitPvalue_paired) %>%
+  filter(rownames(moduleTraitPvalue_paired)!="MEgrey_cbi") %>% 
+  filter((adj_delta_bilateral_thigh_normalized <= p.threshold) |
+           (adj_d_CT_area <= p.threshold) | (adj_d_myofiber_CSA <= p.threshold))
+nominal.mods <-  as.data.frame(moduleTraitPvalue_paired)  %>%
+  filter(rownames(moduleTraitPvalue_paired)!="MEgrey_cbi") %>% 
+  filter((adj_delta_bilateral_thigh_normalized <= 0.05) |
+           (adj_d_CT_area <= 0.05) | (adj_d_myofiber_CSA <= 0.05))
+mods_of_interest_plastic <- str_sub(unique(c(rownames(IDmods), rownames(nominal.mods))),3) #drop the ME
+nominal.mods
+```
+
+### Integrity and Senstivity Checks
+The pink module scatterplot is shown in Figure S7B.
+```{r just plot simply}
+paired_CBI <- cbind(paired_change, CBI_df)
+
+ggplot(paired_CBI) + geom_point(mapping=aes(x=MEpink_cbi,y=adj_d_myofiber_CSA),colour="pink", size = 3) +
+   geom_smooth(mapping=aes(x=MEpink_cbi,y=adj_d_myofiber_CSA), method = "lm", colour = "black") +
+   theme_classic()+
+    theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")) 
+#+ggsave(filename = "../../3_output/1_MASTERS_WGCNA/Scatterplots/paired/pinkCBI_vs_delta_fCSA.pdf", width = 6, height = 3.5)
+
+ggplot(paired_CBI) + geom_point(mapping=aes(x=MEpurple_cbi,y=adj_delta_bilateral_thigh_normalized),colour="purple", size = 3) +
+   geom_smooth(mapping=aes(x=MEpurple_cbi,y=adj_delta_bilateral_thigh_normalized), method = "lm", colour = "black") +
+   theme_classic()+
+    theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")) 
+#+ggsave(filename = "../../3_output/1_MASTERS_WGCNA/Scatterplots/paired/purpleCBI_vs_delta_DEXA.pdf", width = 6, height = 3.5)
+
+ggplot(paired_CBI) + geom_point(mapping=aes(x=MEred_cbi,y=adj_delta_bilateral_thigh_normalized),colour="red", size = 3) +
+   geom_smooth(mapping=aes(x=MEred_cbi,y=adj_delta_bilateral_thigh_normalized), method = "lm", colour = "black") +
+   theme_classic()+
+    theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")) 
+```
+Both red and purple have a single very low one, and the biggest loser on fCSA is also very low on pink, so we will run a sensitivity check on these. 
+
+```{r sensitivity check for pink}
+paired_CBI_sens_check <- paired_CBI %>% 
+  filter(MEpink_cbi<= mean(paired_CBI$MEpink_cbi)+3*sd(paired_CBI$MEpink_cbi) &
+         MEpink_cbi>= mean(paired_CBI$MEpink_cbi)-3*sd(paired_CBI$MEpink_cbi))
+CBIpink.fit <- lm(data = paired_CBI_sens_check, MEpink_cbi ~adj_d_myofiber_CSA)
+summary(CBIpink.fit)
+```
+
+
+```{r run red sens based on low ME cbi}
+paired_CBI_sens_check <- paired_CBI %>% 
+  filter(MEred_cbi<= mean(paired_CBI$MEred_cbi)+3*sd(paired_CBI$MEred_cbi) &
+         MEred_cbi>= mean(paired_CBI$MEred_cbi)-3*sd(paired_CBI$MEred_cbi))
+CBIred.fit <- lm(data = paired_CBI_sens_check, MEred_cbi ~adj_delta_bilateral_thigh_normalized)
+summary(CBIred.fit)
+```
+Red is not upheld.
+
+```{r test purple sensitivity}
+paired_CBI_sens_check <- paired_CBI %>% 
+  filter(MEpurple_cbi<= mean(paired_CBI$MEpurple_cbi)+3*sd(paired_CBI$MEred_cbi) &
+         MEpurple_cbi>= mean(paired_CBI$MEpurple_cbi)-3*sd(paired_CBI$MEred_cbi))
+CBIpurple.fit <- lm(data = paired_CBI_sens_check, MEpurple_cbi ~adj_delta_bilateral_thigh_normalized)
+summary(CBIpurple.fit)
+```
+Also purple does not stand up. We will only pursue the pink for downstream analysis. 
+
+### Intramodular Analysis
+For the mod members table, Gene-Trait significance is not shown (see text). This results because we have changed the eigengene value to a change score; therefore it's challenging to get the association with the trait. The module membership for genes in the pink module is presented in Table S17.
+```{r run pink paired module}
+MEs = moduleEigengenes(paired_expr, modColors_paired)$eigengenes
+  modNames = substring(names(MEs), 3)
+  nSamples = nrow(paired_expr)
+
+#code here is the same thing that generates module gene lists and makes scatterplots
+geneModuleMembership = as.data.frame(cor(paired_expr, MEs, use = "p"));
+  MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+  names(geneModuleMembership) = paste("MM", modNames, sep="");
+  names(MMPvalue) = paste("p.MM", modNames, sep="");
+
+column = match("pink", modNames);
+  moduleGenes = modColors_paired=="pink";
+  
+pink_modmem <- data.frame(abs(geneModuleMembership[moduleGenes, column]),
+                          row.names = rownames(geneModuleMembership[moduleGenes,]))
+  
+names(pink_modmem)[names(pink_modmem)=="abs.geneModuleMembership.moduleGenes..column.."] <- "membership"
+  
+pink_modmem <- pink_modmem %>%
+  rownames_to_column(var = "geneIDs") %>% 
+  separate(geneIDs, into = c("ensg_version","symbol"), sep="_") 
+
+threshold <- median(pink_modmem$membership) #just the 50th percentile
+perc_75th <- quantile(pink_modmem$membership, probs = seq(0, 1, 0.25))[4]
+perc_80th <- quantile(pink_modmem$membership, probs = seq(0, 1, 0.4))[3]
+#ran both to see if there was a big difference in number of genes surpassing threshold
+  
+pink_modmem <- pink_modmem %>% 
+    mutate(top_half = ifelse(membership>=threshold,1,NA),
+           perc_75th = ifelse(membership>=perc_75th,1,NA),
+           perc_80th = ifelse(membership>=perc_80th,1,NA)) %>% 
+  arrange(-membership)
+pink_modmem
+```
+The paired TOM were run in Cheaha on 09.24.20. Below we unpack the getCytoscape function and apply it for use for this one paired module. We have to do this because of the key limitation which is no gene-trait significance column. Instead, we limit interpretation to those genes with the highest membership (kME over 80th percentile).
+This code is not run live in the knit markdown because of computational limitations. Please see Figure S7C for output.
+```{r load toms for paired and pink cytoscape, eval = FALSE}
+#paired_TOM = TOMsimilarityFromExpr(paired_expr, power = 12)
+#load(file = "../../2_pipeline/1_MASTERS_WGCNA/store/paired_TOM.Rdata")
+
+module = "pink"
+detailTable = pink_modmem[!is.na(pink_modmem$perc_80th),] #define 80th percentile
+ExprSet = paired_expr
+fraction="all"
+modColors = modColors_paired
+TOM_matrix = paired_TOM
+ 
+subset <- detailTable %>%
+  mutate(geneID = str_c(ensg_version,symbol,sep="_")) %>%
+  dplyr::select(geneID)
+
+#subset the large matrix to define what meets criteria
+all_genes <- colnames(ExprSet) 
+inSubset = is.finite(match(all_genes, subset$geneID))
+subset_ids = all_genes[inSubset];
+subset_ids_gene <- gsub(pattern = ".*_","",subset_ids)
+  
+#which enables subsetting the TOM matrix to only what meets criteria
+subset_TOM = TOM_matrix[inSubset, inSubset];
+dimnames(subset_TOM) = list(subset_ids_gene, subset_ids_gene)
+  
+#perform export to Cytoscape
+cyt = exportNetworkToCytoscape(subset_TOM,
+                               edgeFile = paste("../../3_output/1_MASTERS_WGCNA/Cytoscape/GeneBiotype-edges-", 
+                                          paste(module, collapse="-"), ".txt", sep=""),
+                               nodeFile = paste("../../3_output/1_MASTERS_WGCNA/Cytoscape/GeneBiotype-nodes", 
+                                           paste(module, collapse="-"), ".txt", sep=""),
+                               weighted = TRUE,
+                               threshold = 0.02,
+                               nodeNames = subset_ids_gene,
+                               altNodeNames = subset_ids_gene,
+                               nodeAttr = modColors[inSubset]);
+}
+```
+
+## PLIER
+### Linear Models to test Plasticity
+
+Calculate the change score for PLIER LVs.
+```{r calculate plier change indices}
+plier_cbi <- as.data.frame(t(MASplier_updated$B))
+
+plier_cbi_3 <- plier_cbi[str_detect(rownames(plier_cbi),"_3$"),]
+plier_cbi_1 <- plier_cbi[str_detect(rownames(plier_cbi),"_1$"),] %>% 
+  rownames_to_column(var = "SeqID") %>% 
+  filter(str_sub(SeqID, 0, -3) %in% str_sub(rownames(plier_cbi_3),0,-3)) %>% 
+  column_to_rownames(var = "SeqID")
+all.equal(str_sub(rownames(plier_cbi_1),0,-3), str_sub(rownames(plier_cbi_3),0,-3)) #good
+
+calc_CBI <- 1 - (plier_cbi_1/plier_cbi_3) 
+to_bind <- pathdata_updated[,c("adj_delta_bilateral_thigh_normalized","adj_d_CT_area","adj_d_myofiber_CSA")]
+to_bind <- to_bind%>% 
+  filter(rownames(to_bind) %in% rownames(calc_CBI)) 
+all.equal(rownames(to_bind), rownames(calc_CBI))
+pathdata_updated_plasticity <- cbind(calc_CBI, to_bind)
+```
+
+```{r run linear models}
+signifTable_plasticity_updated <- as.data.frame(matrix(nrow = nrow(MASplier_updated$B))) %>%
+  mutate(LV = rownames(MASplier_updated$B),adj_delta_bilateral_thigh_normalized = NA, 
+         adj_d_CT_area = NA, adj_d_myofiber_CSA = NA) %>% 
+  dplyr::select(-V1)
+
+for(i in 1:25){
+  j = pathdata_updated_plasticity[,i]
+  fit1 <- lm(data = pathdata_updated_plasticity, formula = j ~ adj_delta_bilateral_thigh_normalized)
+  signifTable_plasticity_updated$adj_delta_bilateral_thigh_normalized[i]=round(summary(fit1)[["coefficients"]][2,4], digits=4)
+  
+  fit2 <- lm(data = pathdata_updated_plasticity, formula = j ~ adj_d_CT_area)
+  signifTable_plasticity_updated$adj_d_CT_area[i]=round(summary(fit2)[["coefficients"]][2,4], digits=4)
+
+  fit3 <- lm(data = pathdata_updated_plasticity, formula = j ~ adj_d_myofiber_CSA)
+  signifTable_plasticity_updated$adj_d_myofiber_CSA[i]=round(summary(fit3)[["coefficients"]][2,4], digits=4)
+}
+
+LVs_of_interest_plastic_updated <- signifTable_plasticity_updated %>%
+  filter(adj_delta_bilateral_thigh_normalized <= 0.05 |
+         adj_d_CT_area <= 0.05 |
+         adj_d_myofiber_CSA <= 0.05)%>% 
+  mutate(LVid = str_extract(LV, pattern="[:digit:]{1,}")) 
+
+LVs_of_interest_plastic_updated
+```
+We can see the associations and we will do something similar to the mods_of_interest table above (automating this is not necessary since it's only four).
+
+```{r plot the plasticity LVs}
+LVs_plasticity <- as.data.frame(LVs_of_interest_plastic_updated$LVid) %>% 
+  rename("LV" = "LVs_of_interest_plastic_updated$LVid") %>% 
+  mutate(LV = as.numeric(LV)) %>% 
+  mutate(trait = c("adj_d_myofiber_CSA","adj_d_myofiber_CSA","adj_delta_bilateral_thigh_normalized","adj_d_myofiber_CSA"))
+
+for (i in 1:nrow(LVs_plasticity)){
+  print(ggplot(pathdata_updated_plasticity) +
+  geom_point(mapping=aes(x=pathdata_updated_plasticity[,LVs_plasticity$LV[i]],
+                         y=pathdata_updated_plasticity[,names(pathdata_updated_plasticity)==LVs_plasticity$trait[i]]),
+             colour="black", size = 3) +
+  geom_smooth(mapping=aes(x=pathdata_updated_plasticity[,LVs_plasticity$LV[i]],
+                          y=pathdata_updated_plasticity[,names(pathdata_updated_plasticity)==LVs_plasticity$trait[i]]),
+              method = "lm", colour = "black") +
+  scale_y_continuous(name = LVs_plasticity$trait[i]) + 
+  scale_x_continuous(name = str_c("LV",LVs_plasticity$LV[i])) +
+  theme_classic()+
+  theme(axis.text.x = element_text(size = 14, colour = "black"), 
+          axis.text.y = element_text(size = 14, colour = "black"), 
+          axis.ticks.length = unit(10, "pt")))
+  }
+```
+Clearly, some interesting patterns are obvious. Those that do not appear to have good spread around the x axis will likely be lost during sensitivity checks. Below, we explore this.
+
+
+### Sensitivity Checks
+The resulting table is the final column of manuscript Table 2 (Plasticity LVs). Because no LVs were related to CT, we will only focus on the secondary DXA outcome and the exploratory myofiber CSA outcome.
+```{r sensitivity test for plier cbi lvs}
+names(pathdata_updated_plasticity)[1:25] <- str_c("LV",c(1:25))
+outlier_check_plasticity <- as.data.frame(matrix(ncol = 6, nrow=25))
+names(outlier_check_plasticity) <- c("LV","n", "r_val_adj_delta_bilateral_thigh_normalized",
+                                     "p_val_adj_delta_bilateral_thigh_normalized", "r_val_adj_d_myofiber_CSA",
+                                     "p_val_adj_d_myofiber_CSA")
+for (i in 1:25){ 
+  name = str_c("LV",i) 
+  outlier_check_plasticity$LV[i] = name
+  clean_path <- pathdata_updated_plasticity %>%  #drops anyone above and below 3 standard deviations
+    filter(pathdata_updated_plasticity[,name]<= mean(pathdata_updated_plasticity[,name])+
+             3*sd(pathdata_updated_plasticity[,name]) &
+           pathdata_updated_plasticity[,name]>= mean(pathdata_updated_plasticity[,name])-
+             3*sd(pathdata_updated_plasticity[,name]))
+  
+  fit <- lm(data = clean_path, clean_path[,name] ~adj_delta_bilateral_thigh_normalized)
+  outlier_check_plasticity$r_val_adj_delta_bilateral_thigh_normalized[i] <- round(summary(fit)$r.squared,3)
+  outlier_check_plasticity$p_val_adj_delta_bilateral_thigh_normalized[i] <- round(summary(fit)[["coefficients"]][2,4],3)
+  
+  outlier_check_plasticity$n[i] <- nrow(clean_path) 
+  fit2 <- lm(data = clean_path, clean_path[,name] ~adj_d_myofiber_CSA)
+  outlier_check_plasticity$r_val_adj_d_myofiber_CSA[i] <- round(summary(fit2)$r.squared,3)
+  outlier_check_plasticity$p_val_adj_d_myofiber_CSA[i] <- round(summary(fit2)[["coefficients"]][2,4],3)
+}
+
+#present LVs that survive the check for CT and DXA; write to a variable so we can use it later
+LV_sensitivity_check_plasticity <- outlier_check_plasticity %>% 
+  filter(LV %in% str_c("LV",LVs_of_interest_plastic_updated$LVid)) %>% 
+  filter(p_val_adj_d_myofiber_CSA <.05 | p_val_adj_delta_bilateral_thigh_normalized<0.05)
+LV_sensitivity_check_plasticity
+```
+There is just one: LV20.
+
+###Generate Table for Plastic LVs
+Unfortunately, I don't think we can plot the gene-by-gene heatmap for this LV. Much like the pink scatterplot above, we cannot generate the same effect since we have created change scores from the expressoin data. The resulting heatmap is not very informative. Instead, just export the top 100 genes and present in Table S18.
+```{r create LV 20 table, eval = FALSE}
+LVtablemaker(plierRes = MASplier_updated, data = newyN, priorMat = allPaths, index = 20, top = 100, 
+             path = "../3_output/2_MASTERS_PLIER/LVtables")
+```
+
+## Integration and Comparison of Pipelines
+The PLIER analysis is used to annotate top genes in the WGCNA Plasticity analysis pink module (Table S17).
+```{r pink PLIER connections}
+pinkPLIER <- mod_LV_check(plierResult = MASplier_updated, 
+                          genetable = read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/paired/pinkGeneTable.csv"))
+
+summary(as.factor(gsub(".*,","",pinkPLIER$LV_path)))
+#write.csv(pinkPLIER, "../../3_output/1_MASTERS_WGCNA/Cytoscape/PLIER_connections_pink.csv")
+```
+
+We cannot test for overlapping "key" genes because the networks are not related to the same outcome metrics.
+
+####Table 2
+We will merge the prediction and response LVs for presentation. Prepare for merging from tables produced along the way.
+```{r create table 2}
+LV_Table2_prediction <- LV_sensitivity_check %>%  
+  dplyr::select(-n, -starts_with("r_val")) %>% 
+  rename("prediction_adj_d_CT_area"="p_val_adj_d_CT_area", 
+         "prediction_adj_delta_bilateral_thigh_normalized" = "p_val_adj_delta_bilateral_thigh_normalized") %>% 
+  mutate(prediction_adj_d_CT_area = ifelse(prediction_adj_d_CT_area<=0.05, prediction_adj_d_CT_area, NA),
+         prediction_adj_delta_bilateral_thigh_normalized = ifelse(prediction_adj_delta_bilateral_thigh_normalized<=0.05, prediction_adj_delta_bilateral_thigh_normalized, NA))
+LV_Table2_response <- LV_sensitivity_check_response %>% 
+  mutate(LV= paste0("LV", LVid)) %>% 
+  dplyr::select(-LVid) %>%  rename("response_pre_vs_post" = "adj_p_RTeffect")
+
+LV_Table2_plasticity <- LV_sensitivity_check_plasticity %>%  
+  dplyr::select(-n, -starts_with("r_val"), -contains("myofiber")) %>% 
+  rename("plasticity_adj_delta_bilateral_thigh_normalized"= "p_val_adj_delta_bilateral_thigh_normalized")
+
+full_join(LV_Table2_prediction, LV_Table2_response, by = "LV") %>% 
+  full_join(LV_Table2_plasticity) %>% 
+  arrange(as.numeric(gsub("LV","",LV)))
+
+```
+
+# Interpretation and Discussion
+## MetaMEx Directional Analysis
+In order to help us interpret some of the overlaps and pathway annotations, we need to go back to the original MetaMEx data outputs and examine the directions of these. Let's start with resistance training.
+```{r retrieve directions for RT genes, eval= FALSE}
+RT_Stats <- readRDS("/data/user/kmlavin/PLIER/0_data/training_resistance.Rds")
+processed_data <- RT_Stats %>% 
+  dplyr::select(contains("_HLY_"))%>% 
+  mutate(gene = rownames(RT_Stats)) %>% 
+  relocate(gene, .before = colnames(RT_Stats)[1]) %>%
+  pivot_longer(-gene, names_to ="studyID", values_to = "value") %>%
+  separate(studyID, into = c("stat", "GEO", "exercise", "mode", "muscle", "sex",
+                             "age", "trained", "lean","healthy","hour","week"),sep = "_") %>% 
+  filter(stat == "logFC" | stat == "adj.P.Val")
+RT_gene_data <- pivot_wider(processed_data, names_from = stat, values_from = value) 
+```
+
+```{r create directional vectors for RT}
+load("/data/user/kmlavin/PLIER/2_pipeline/store/MetaMExMatrix.Rdata")
+load("../../2_pipeline/1_MASTERS_WGCNA/store/MetaMEx_directional.Rdata")
+        
+RT_up <- RT_gene_data %>%
+  filter((logFC > 1) & (adj.P.Val <= 0.05))
+RT_down <- RT_gene_data %>% 
+  filter((logFC < -1) & (adj.P.Val <= 0.05))
+        
+RT_up_genes <- unique(RT_up$gene)
+RT_down_genes <- unique(RT_down$gene)
+
+RT_common <- unique(c(RT_up_genes, RT_down_genes))
+all(RT_common %in% RT_geneset) #matches input that would have gone into PLIER
+```
+
+We will look for overlaps with the up vs. down lists to see the general direction of the patterns.
+```{r use idoverlaps}
+#load those that are not in environment
+pinkgenes <- read.csv(file="../../3_output/1_MASTERS_WGCNA/GeneTables/paired/pinkGeneTable.csv")
+salmon_gene_table <- read.csv("../../3_output/1_MASTERS_WGCNA/GeneTables/basal/salmonGeneTable.csv")
+
+red_RT_up <- IDoverlaps(red_gene_table$symbol, RT_up_genes) #23 
+red_RT_down <- IDoverlaps(red_gene_table$symbol, RT_down_genes) #3
+
+magenta_RT_up <- IDoverlaps(magenta_gene_table$symbol, RT_up_genes) #16 
+magenta_RT_down <- IDoverlaps(magenta_gene_table$symbol, RT_down_genes) #3
+
+salmon_RT_up <- IDoverlaps(salmon_gene_table$symbol, RT_up_genes) #27 
+salmon_RT_down <- IDoverlaps(salmon_gene_table$symbol, RT_down_genes) #0
+
+pink_RT_up <- IDoverlaps(pinkgenes$symbol, RT_up_genes) #18
+pink_RT_down <- IDoverlaps(pinkgenes$symbol, RT_down_genes) #1
+```
+
+Aerobic training popped out a bit in the analysis too so it would be a good idea to have the lists. 
+```{r retrieve directions for AT genes, eval = FALSE}
+AT_Stats <- readRDS("/data/user/kmlavin/PLIER/0_data/training_aerobic.Rds")
+
+processed_data <- AT_Stats %>% 
+  dplyr::select(contains("_HLY_"))%>% 
+  mutate(gene = rownames(AT_Stats)) %>% 
+  relocate(gene, .before = colnames(AT_Stats)[1]) %>%
+  pivot_longer(-gene, names_to ="studyID", values_to = "value") %>%
+  separate(studyID, into = c("stat", "GEO", "exercise", "mode", "muscle", "sex",
+                             "age", "trained", "lean","healthy","hour","week"),sep = "_") %>% 
+  filter(stat == "logFC" | stat == "adj.P.Val")
+AT_gene_data <- pivot_wider(processed_data, names_from = stat, values_from = value) 
+
+```
+
+```{r create directional vectors for AT}
+AT_up <- AT_gene_data %>% 
+  filter((logFC > 1) & (adj.P.Val <= 0.05))
+AT_down <- AT_gene_data %>% 
+  filter((logFC < -1) & (adj.P.Val <= 0.05))
+
+AT_up_genes <- unique(AT_up$gene)
+AT_down_genes <- unique(AT_down$gene)
+
+AT_common <- unique(c(AT_up_genes, AT_down_genes))
+all(AT_common %in% AT_geneset) #matches input that would have gone into PLIER
+```
+
+```{r connections to mods of interest for AT}
+red_AT_up <- IDoverlaps(red_gene_table$symbol, AT_up_genes) #14 
+red_AT_down <- IDoverlaps(red_gene_table$symbol, AT_down_genes) #3
+
+magenta_AT_up <- IDoverlaps(magenta_gene_table$symbol, AT_up_genes) #9 
+magenta_AT_down <- IDoverlaps(magenta_gene_table$symbol, AT_down_genes) #2
+
+salmon_AT_up <- IDoverlaps(salmon_gene_table$symbol, AT_up_genes) #3
+salmon_AT_down <- IDoverlaps(salmon_gene_table$symbol, AT_down_genes) #1
+
+pink_AT_up <- IDoverlaps(pinkgenes$symbol, AT_up_genes) #7
+pink_AT_down <- IDoverlaps(pinkgenes$symbol, AT_down_genes) #3
+```
+These were manually compiled to produce Table S15.
+
+
+## Comparison to Lab MicroArray Work 
+A clear question is whether any of the genes we found in the red and magenta modules are in any way similar to what was driving the responder status in the Thalacker Mercer 2013 publication. 
+Let's pull in data from the supplement.
+```{r Thalacker Mercer supplement}
+TMgenes <- read.csv("../../0_data/TM_gene_fold_differences.csv") %>% 
+  rename("Extr_Non" = "Xt_Non",
+         "Extr_Mod" = "Xtr_Mod") %>% 
+  dplyr::select(-starts_with("X"))
+
+TMgenes$Extr_Non[TMgenes$Extr_Non=="ND"] <- NA
+TMgenes$Extr_Mod[TMgenes$Extr_Mod=="ND"] <- NA
+TMgenes$Mod_Non[TMgenes$Mod_Non=="ND"] <- NA #might be convenient to have them as these
+```
+
+We will also collapse the red and magenta modules, both of which were associated with the whole-muscle hypertrophy outcomes of interest to at least a nominal degree. 
+```{r current gene list of interest}
+current_genes <- c(red_gene_table$symbol, magenta_gene_table$symbol)
+microarray_genes <- TMgenes$Gene
+
+show <- IDoverlaps(current_genes, microarray_genes)
+
+TMgenes[TMgenes$Gene %in% show,]
+```
+Only three are the same, but the directionality seems different. DCN and TGFB1 are actually lower in responders in the other paper. LAMA1 is following the same pattern, but only in Extr vs. Mod. 
+
+It may be of interest to collapse the PLIER LVs that were most associated with the changes.
+```{r look at CT LV gene lists}
+all_CT_genes <- unique(c(LV7$X, LV16$X, LV23$X)) 
+show <- IDoverlaps(all_CT_genes, microarray_genes)
+
+TMgenes[TMgenes$Gene %in% show,]
+```
+Here there are three, and two are in the same direction this time. We interpret this in the Discussion, keeping in mind that both LV7 and LV23 actually have negative relationships with hypetrophy.
+```{r where is RELA}
+"RELA" %in% LV23$X #completely lucky guess 
+```
+Thus all three genes that overlap are in fact in the same direction.
+
+What about the LV that syncs up with DXA?
+```{r look at DEXA gene lists}
+LV19 <- read.csv("../../3_output/2_MASTERS_PLIER/SensitivityCheck/LVtables/DXA/LV19_table_Top100.csv")
+show <- IDoverlaps(LV19$X, microarray_genes)
+
+TMgenes[TMgenes$Gene %in% show,]
+```
+Here we see two genes, going in opposite direction. IGF2 might be an interesting one to follow up, but overall there is rather little overlap. 
+
+# Directory
+All preliminary code can be found in: /data/project/bamman-lab/MASTERS/1_code
+Subdirectories for WGCNA and PLIER. BE sure to see PLIER sensitivity check in /MASTERS/2_pipeline/2_MASTERS_PLIER/MASTERS_PLIER_senscheck.Rmd
+
+```{r export list of variables generated in markdown}
+listofthings <- ls()
+write.csv(listofthings, file = "../3_output/R_environment_variables.csv")
+```
+
+# GEO Data Export
+For this paper, the majority of samples have already been uploaded to GEO. We included 4 others that were not part of the  original data set. Therefore, we will subset to those four for relevant phenotypes and make sure that we create a featureCounts file that only has those. 
+Update: GEO actually wants all of the included samples to be part of this analysis. We need to export the data set for all 53 samples, and then they will pull the FASTQs from the original posting, in accession number GSE157585
+```{r generate data to fill in GEO template}
+pheno.export <- pheno.long %>% 
+  #filter(SeqID %in% c("P_5_1", "P_5_3", "P_8_1", "P_8_3")) %>% 
+  dplyr::select(SeqID, Age, Sex) %>% 
+  mutate(Timepoint = str_sub(SeqID, -1))
+keepcounts <- c("P_5_1", "P_5_3", "P_8_1", "P_8_3")
+
+featureCounts <- cts.updated %>% 
+  dplyr::select(all_of(keepcounts))
+#write.table(featureCounts, file="../../5_manuscript/GEO/featureCounts.txt")
+
+#write.csv(pheno.export, file="../../5_manuscript/GEO/subjects.csv")
+```
+
+md5 sums were created in linux using the following commands: 
+```{r linux md5, eval=FALSE}
+cd /data/project/bamman-lab/MASTERS/0_data/0_preprocessing
+find ../FASTQ/ -name "*.fq.*" -exec md5sum {} \; > ../FASTQ/GEOmd5.list8c709d0  featureCounts.txt
+```
+...and the md5 list file was manually exported to my desktop and used to fill in the Excel sheet.
+
+For the others, we need to pull the GSM number from GEO.
+```{r pull previous masters data}
+gsm <- read.csv("../../5_manuscript/GEO/GSE157585.csv", header = FALSE)
+gsm <- t(gsm)
+gsm <- as.data.frame(gsm)
+names(gsm) <- c("ID","GSM")
+gsm_new <- gsm %>% 
+  mutate(SeqID = str_extract(ID, pattern = "(?#:)[:graph:]{1,}")) %>% 
+  mutate(SeqID = gsub(pattern = ":", replacement = "", SeqID)) %>% 
+  filter(SeqID %in% names(cts.updated))
+gsm_new
+n_distinct(gsm_new$GSM)
+
+key <- gsm_new %>% 
+  dplyr::select(SeqID, GSM)
+
+addthese <- names(cts.updated[!names(cts.updated) %in% key$SeqID])
+
+add.these <- as.data.frame(addthese) %>% 
+  mutate(GSM = addthese) %>% 
+  rename("SeqID" = addthese)
+
+key2 <- rbind(add.these, key)
+
+processed_data <- cts.updated %>% 
+    rename_with(~str_replace_all(., key2$SeqID, key2$GSM)) 
+
+#write.table(processed_data, file="../../5_manuscript/GEO/featureCounts.txt")
+```

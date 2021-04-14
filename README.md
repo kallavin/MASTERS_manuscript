@@ -1,5 +1,5 @@
 # MASTERS_manuscript
-Code and relevant items to accompany Muscle Transcriptional Networks Linked to Resistance Exercise Training Hypertrophic Response Heterogeneity” (Lavin &amp; Bell, et al., Physiol Genomics submission). 
+Code and relevant items to accompany Muscle Transcriptional Networks Linked to Resistance Exercise Training Hypertrophic Response Heterogeneity” (Lavin &amp; Bell, et al., Physiol Genomics, 2021). 
 This code describes application of network biology tools WGCNA and PLIER to phenotypic exercise data.
 
 ## Background and Objectives
